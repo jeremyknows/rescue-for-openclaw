@@ -200,6 +200,30 @@ No code change needed:
 export RESCUE_AGENT_ALIASES='{"watson":"main","barker":"herald"}'
 ```
 
+## File Structure
+
+```
+rescue-for-openclaw/
+├── index.js        # The entire bot — single file, ~1600 lines
+├── package.json    # Only dependency: discord.js
+├── LICENSE         # MIT
+└── README.md
+```
+
+No build step. No config files. Clone, `npm install`, run.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Bot connects but ignores commands | Wrong `DISCORD_ADMIN_USER_ID` | Check your Discord user ID (enable Developer Mode, right-click yourself) |
+| `!status all` returns error | Too many agents/sessions for one message | Fixed in current version (auto-splits long messages) |
+| `!rollback` says no backups | Never ran `!backup` | Run `!backup` first to create a snapshot |
+| `!restart gateway` kills but doesn't restart | Gateway not managed by launchd/systemd | Set up a process manager with auto-restart (see service configs above) |
+| Watchdog shows "down" but gateway is running | `RESCUE_GATEWAY_PROCESS` doesn't match | Check `ps aux \| grep openclaw` for the actual process name |
+| `!start` says bridge script not found | ask-watson bridge not installed | `!start` requires the OpenClaw bridge script — other commands work without it |
+| `!mute` fails with "account not found" | Agent's Discord account not in config | Check `openclaw.json` for the agent's Discord account binding |
+
 ## Roadmap
 
 - [ ] **Telegram support** — same commands, works in Telegram groups alongside Discord
