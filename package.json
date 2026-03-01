@@ -1,0 +1,28 @@
+{
+  "name": "rescue-bot",
+  "version": "1.0.0",
+  "description": "Discord admin bot for OpenClaw — session management, config rollback, and crash-loop detection",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "openclaw",
+    "discord",
+    "bot",
+    "admin",
+    "session-management",
+    "ai-agents"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jeremyknows/rescue-bot.git"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
