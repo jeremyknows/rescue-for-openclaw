@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * Rescue — Discord Admin Bot for OpenClaw
+ * Rescue — Admin Bot for OpenClaw (Discord + Telegram)
  *
  * Standalone bot (independent of the OpenClaw gateway) that provides
- * admin commands for managing agent sessions directly from Discord.
+ * admin commands for managing agent sessions from Discord or Telegram.
  * Designed as a "rescue" tool — works even when the gateway is down.
  *
  * Commands:
- *   !reset              — Reset the agent session bound to this channel
+ *   !reset              — Reset the agent session bound to this channel/chat
  *   !reset <agent>      — Reset agent in this channel (supports aliases)
  *   !reset <agent> all  — Reset ALL sessions for an agent everywhere
  *   !status             — Show session health for this channel's agent
@@ -17,28 +17,35 @@
  *   !model <alias>      — Override model for this session
  *   !model show         — Show current model override
  *   !model default      — Clear model override
- *   !mute [agent]       — Require @mention for agent in this channel
- *   !unmute [agent]     — Let agent respond to all messages in channel
+ *   !mute [agent]       — Require @mention for agent (Discord only)
+ *   !unmute [agent]     — Let agent respond to all messages (Discord only)
  *   !keys status        — Show auth-profile health across all agents
  *   !backup             — Snapshot the current gateway config
  *   !rollback           — Restore last known good config + restart gateway
  *   !rollback list      — Show recent config backups
+ *   !watchdog           — Show gateway health and restart history
  *   !help               — Display command help
  *
- * Environment (required):
- *   DISCORD_BOT_TOKEN         — Bot token (also accepts DISCORD_ADMIN_BOT_TOKEN)
- *   DISCORD_ADMIN_USER_ID     — Your Discord user ID for auth
+ * Environment (at least one platform required):
+ *   DISCORD_BOT_TOKEN         — Discord bot token (also accepts DISCORD_ADMIN_BOT_TOKEN)
+ *   DISCORD_ADMIN_USER_ID     — Discord user ID for auth
+ *   TELEGRAM_BOT_TOKEN        — Telegram bot token from @BotFather
+ *   TELEGRAM_ADMIN_USER_ID    — Telegram user ID for auth
  *
  * Environment (optional):
  *   OPENCLAW_DIR               — OpenClaw base directory (default: ~/.openclaw)
- *   RESCUE_PREFIX              — Command prefix (default: !)
+ *   RESCUE_PREFIX              — Command prefix for Discord (default: !)
+ *   RESCUE_TELEGRAM_PREFIX     — Command prefix for Telegram (default: /)
  *   RESCUE_AGENT_ALIASES       — JSON map of aliases, e.g. {"watson":"main"}
  *   RESCUE_OPS_CHANNEL_ID      — Discord channel ID for system alerts
+ *   RESCUE_OPS_TELEGRAM_CHAT   — Telegram chat ID for system alerts
  *   RESCUE_STALL_MINUTES       — Minutes before stall alert (default: 15)
  *   RESCUE_MAX_BACKUPS         — Max config backups to keep (default: 20)
+ *   RESCUE_GATEWAY_PROCESS     — Gateway process name (default: openclaw-gateway)
  */
 
 const { Client, GatewayIntentBits } = require("discord.js");
+const { Bot } = require("grammy");
 const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
@@ -48,9 +55,12 @@ const { exec, execFile } = require("child_process");
 // Config — all customizable via environment variables
 // ---------------------------------------------------------------------------
 
-const BOT_TOKEN =
+const DISCORD_TOKEN =
   process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_ADMIN_BOT_TOKEN;
-const ADMIN_USER_ID = process.env.DISCORD_ADMIN_USER_ID;
+const DISCORD_ADMIN_ID = process.env.DISCORD_ADMIN_USER_ID;
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_ADMIN_ID = process.env.TELEGRAM_ADMIN_USER_ID;
+
 const OPENCLAW_DIR =
   process.env.OPENCLAW_DIR || path.join(os.homedir(), ".openclaw");
 const AGENTS_DIR = path.join(OPENCLAW_DIR, "agents");
@@ -58,25 +68,23 @@ const LOGS_DIR = path.join(OPENCLAW_DIR, "logs");
 const AUDIT_LOG = path.join(LOGS_DIR, "rescue-bot-audit.jsonl");
 const CONFIG_PATH = path.join(OPENCLAW_DIR, "openclaw.json");
 const BACKUP_DIR = path.join(OPENCLAW_DIR, "backups");
-const PREFIX = process.env.RESCUE_PREFIX || "!";
+const DISCORD_PREFIX = process.env.RESCUE_PREFIX || "!";
+const TELEGRAM_PREFIX = process.env.RESCUE_TELEGRAM_PREFIX || "/";
 const OPS_CHANNEL_ID = process.env.RESCUE_OPS_CHANNEL_ID || null;
+const OPS_TELEGRAM_CHAT = process.env.RESCUE_OPS_TELEGRAM_CHAT || null;
 const MAX_BACKUPS = parseInt(process.env.RESCUE_MAX_BACKUPS) || 20;
 
-// Agent aliases — friendly names that resolve to agent directory IDs
-// Set via RESCUE_AGENT_ALIASES='{"watson":"main","barker":"herald"}'
+// Agent aliases
 let AGENT_ALIASES = {};
 try {
   if (process.env.RESCUE_AGENT_ALIASES) {
     AGENT_ALIASES = JSON.parse(process.env.RESCUE_AGENT_ALIASES);
   }
 } catch (err) {
-  console.error(
-    "[rescue] Failed to parse RESCUE_AGENT_ALIASES:",
-    err.message
-  );
+  console.error("[rescue] Failed to parse RESCUE_AGENT_ALIASES:", err.message);
 }
 
-// Stall detection — configurable thresholds
+// Stall detection
 const STALL_THRESHOLD_MS =
   (parseInt(process.env.RESCUE_STALL_MINUTES) || 15) * 60 * 1000;
 const STALL_ACTIVE_WINDOW = 30 * 60 * 1000;
@@ -84,49 +92,91 @@ const STALL_CHECK_INTERVAL = 60 * 1000;
 const STALL_ALERT_COOLDOWN = 60 * 60 * 1000;
 const staleAlertTimes = new Map();
 
-// Gateway watchdog — crash-loop detection
-const WATCHDOG_INTERVAL = 30 * 1000; // Poll every 30s
-const WATCHDOG_CRASH_THRESHOLD = 3; // Restarts to trigger alert
-const WATCHDOG_CRASH_WINDOW = 5 * 60 * 1000; // 5 minute window
-const WATCHDOG_ALERT_COOLDOWN = 30 * 60 * 1000; // 30 min between alerts
-const GATEWAY_PROCESS_NAME = process.env.RESCUE_GATEWAY_PROCESS || "openclaw-gateway";
+// Gateway watchdog
+const WATCHDOG_INTERVAL = 30 * 1000;
+const WATCHDOG_CRASH_THRESHOLD = 3;
+const WATCHDOG_CRASH_WINDOW = 5 * 60 * 1000;
+const WATCHDOG_ALERT_COOLDOWN = 30 * 60 * 1000;
+const GATEWAY_PROCESS_NAME =
+  process.env.RESCUE_GATEWAY_PROCESS || "openclaw-gateway";
 const watchdogState = {
-  lastPid: null, // Last known gateway PID
-  restarts: [], // Timestamps of detected restarts (bounded to 20)
-  lastAlertTime: 0, // Last alert timestamp
-  lastCheckTime: 0, // Last poll timestamp
-  status: "starting", // "healthy" | "down" | "crash-loop" | "cooldown" | "starting"
+  lastPid: null,
+  restarts: [],
+  lastAlertTime: 0,
+  lastCheckTime: 0,
+  status: "starting",
 };
 
-if (!BOT_TOKEN) {
+// Require at least one platform
+if (!DISCORD_TOKEN && !TELEGRAM_TOKEN) {
   console.error(
-    "DISCORD_BOT_TOKEN (or DISCORD_ADMIN_BOT_TOKEN) is required"
+    "At least one platform is required: set DISCORD_BOT_TOKEN or TELEGRAM_BOT_TOKEN"
   );
   process.exit(1);
 }
-if (!ADMIN_USER_ID) {
-  console.error("DISCORD_ADMIN_USER_ID is required");
-  process.exit(1);
-}
 
 // ---------------------------------------------------------------------------
-// Discord message helpers (2000 char limit)
+// Messaging abstraction — unified interface for Discord and Telegram
 // ---------------------------------------------------------------------------
 
-const DISCORD_MAX = 2000;
-
-/** Reply to a message, splitting into multiple messages if needed. */
-async function safeReply(message, text) {
-  if (text.length <= DISCORD_MAX) {
-    return message.reply(text);
+/**
+ * Unified message context that wraps both Discord messages and Telegram contexts.
+ * All command handlers receive this instead of platform-specific objects.
+ */
+class MessageContext {
+  /**
+   * @param {object} opts
+   * @param {string} opts.userId - Sender's user ID
+   * @param {string} opts.chatId - Channel/chat ID
+   * @param {"discord"|"telegram"} opts.platform
+   * @param {string} opts.prefix - Command prefix for this platform
+   * @param {function(string): Promise} opts.replyFn - Reply to the triggering message
+   * @param {function(string): Promise} opts.sendFn - Send a new message to the same chat
+   * @param {object} [opts.raw] - Original platform object (for platform-specific commands)
+   */
+  constructor({ userId, chatId, platform, prefix, replyFn, sendFn, raw }) {
+    this.userId = userId;
+    this.chatId = chatId;
+    this.platform = platform;
+    this.prefix = prefix;
+    this._reply = replyFn;
+    this._send = sendFn;
+    this.raw = raw;
+    this.maxMessageLength = platform === "telegram" ? 4096 : 2000;
   }
 
-  // Split on newlines, respecting the character limit
+  /** Reply to the triggering message (auto-splits if too long). */
+  async reply(text) {
+    return safeSend(this, text, true);
+  }
+
+  /** Send a new message to the same chat (auto-splits if too long). */
+  async send(text) {
+    return safeSend(this, text, false);
+  }
+}
+
+/** Send or reply with auto-splitting for message length limits. */
+async function safeSend(ctx, text, isReply) {
+  const max = ctx.maxMessageLength;
+
+  if (text.length <= max) {
+    return isReply ? ctx._reply(text) : ctx._send(text);
+  }
+
   const chunks = [];
   let current = "";
   for (const line of text.split("\n")) {
-    if (current.length + line.length + 1 > DISCORD_MAX) {
+    if (current.length + line.length + 1 > max) {
       if (current) chunks.push(current);
+      // If a single line exceeds max, split it
+      if (line.length > max) {
+        for (let i = 0; i < line.length; i += max) {
+          chunks.push(line.slice(i, i + max));
+        }
+        current = "";
+        continue;
+      }
       current = line;
     } else {
       current = current ? current + "\n" + line : line;
@@ -134,11 +184,42 @@ async function safeReply(message, text) {
   }
   if (current) chunks.push(current);
 
-  // First chunk as reply, rest as follow-up messages
-  await message.reply(chunks[0]);
-  for (let i = 1; i < chunks.length; i++) {
-    await message.channel.send(chunks[i]);
+  // First chunk as reply, rest as follow-up sends
+  if (isReply) {
+    await ctx._reply(chunks[0]);
+  } else {
+    await ctx._send(chunks[0]);
   }
+  for (let i = 1; i < chunks.length; i++) {
+    await ctx._send(chunks[i]);
+  }
+}
+
+/** Create a MessageContext from a Discord message. */
+function fromDiscord(message) {
+  return new MessageContext({
+    userId: message.author.id,
+    chatId: message.channel.id,
+    platform: "discord",
+    prefix: DISCORD_PREFIX,
+    replyFn: (text) => message.reply(text),
+    sendFn: (text) => message.channel.send(text),
+    raw: message,
+  });
+}
+
+/** Create a MessageContext from a grammY context. */
+function fromTelegram(tgCtx) {
+  return new MessageContext({
+    userId: String(tgCtx.from?.id),
+    chatId: String(tgCtx.chat?.id),
+    platform: "telegram",
+    prefix: TELEGRAM_PREFIX,
+    replyFn: (text) => tgCtx.reply(text, { parse_mode: undefined }),
+    sendFn: (text) =>
+      tgCtx.api.sendMessage(tgCtx.chat.id, text, { parse_mode: undefined }),
+    raw: tgCtx,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +298,7 @@ async function acquireLock(sessionsFile) {
       return lockDir;
     }
   } catch {
-    // Lock was removed by another process
+    // Lock removed by another process
   }
   throw new Error("Could not acquire lock on sessions.json (timeout)");
 }
@@ -235,7 +316,9 @@ async function releaseLock(lockDir) {
 // ---------------------------------------------------------------------------
 
 function isValidAgentId(id) {
-  return /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(id) && id.length <= 64;
+  return (
+    /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(id) && id.length <= 64
+  );
 }
 
 async function listAgentIds() {
@@ -304,16 +387,32 @@ async function readSessionsJson(agentId) {
   }
 }
 
-async function findSessionByChannel(channelId) {
+/** Find the session bound to a chat — searches for both discord and telegram patterns. */
+async function findSessionByChat(chatId, platform) {
   const agents = await listAgentIds();
-  const pattern = `discord:channel:${channelId}`;
+
+  // Build search patterns for the platform
+  const patterns = [];
+  if (platform === "discord") {
+    patterns.push(`discord:channel:${chatId}`);
+  } else if (platform === "telegram") {
+    patterns.push(`telegram:chat:${chatId}`);
+    patterns.push(`telegram:channel:${chatId}`);
+    // Some setups may use just the numeric chat ID
+    patterns.push(`:${chatId}`);
+  } else {
+    // Unknown platform — search broadly
+    patterns.push(chatId);
+  }
 
   for (const agentId of agents) {
     const result = await readSessionsJson(agentId);
     if (!result) continue;
     for (const [key, entry] of Object.entries(result.data)) {
-      if (key.endsWith(pattern) || key.includes(pattern + ":")) {
-        return { agentId, key, entry, sessionsFile: result.filePath };
+      for (const pattern of patterns) {
+        if (key.endsWith(pattern) || key.includes(pattern + ":")) {
+          return { agentId, key, entry, sessionsFile: result.filePath };
+        }
       }
     }
   }
@@ -386,7 +485,7 @@ function getUsageInfo(entry) {
 // !reset
 // ---------------------------------------------------------------------------
 
-async function handleReset(message, args) {
+async function handleReset(ctx, args) {
   const target = args[0];
   const allFlag = args[1]?.toLowerCase() === "all";
 
@@ -394,44 +493,46 @@ async function handleReset(message, args) {
     const agentId = await resolveAgentId(target);
     if (!agentId) {
       const list = await formatAgentList();
-      return message.reply(`Agent \`${target}\` not found. Available: ${list}`);
+      return ctx.reply(`Agent \`${target}\` not found. Available: ${list}`);
     }
 
     if (allFlag) {
       const sessions = await findSessionsByAgent(agentId);
       if (sessions.length === 0) {
-        await auditLog(message.author.id, "reset", [agentId, "all"], message.channel.id, "no_sessions");
-        return message.reply(`No sessions found for **${agentDisplayName(agentId)}**.`);
+        await auditLog(ctx.userId, "reset", [agentId, "all"], ctx.chatId, "no_sessions");
+        return ctx.reply(
+          `No sessions found for **${agentDisplayName(agentId)}**.`
+        );
       }
       for (const session of sessions) {
         await resetSession(session);
       }
-      await auditLog(message.author.id, "reset", [agentId, "all"], message.channel.id, `reset_all_${sessions.length}`);
-      return message.reply(
+      await auditLog(ctx.userId, "reset", [agentId, "all"], ctx.chatId, `reset_all_${sessions.length}`);
+      return ctx.reply(
         `\u{1F504} Reset **all ${sessions.length}** sessions for **${agentDisplayName(agentId)}**. Send a message to start fresh.`
       );
     }
 
-    const session = await findSessionByChannel(message.channel.id);
+    const session = await findSessionByChat(ctx.chatId, ctx.platform);
     if (!session || session.agentId !== agentId) {
-      await auditLog(message.author.id, "reset", [agentId], message.channel.id, "not_in_channel");
-      return message.reply(
+      await auditLog(ctx.userId, "reset", [agentId], ctx.chatId, "not_in_channel");
+      return ctx.reply(
         `**${agentDisplayName(agentId)}** doesn't have a session in this channel.\n` +
-        `Use \`${PREFIX}reset ${target} all\` to reset all their sessions everywhere.`
+          `Use \`${ctx.prefix}reset ${target} all\` to reset all their sessions everywhere.`
       );
     }
     const usage = getUsageInfo(session.entry);
     await resetSession(session);
-    await auditLog(message.author.id, "reset", [agentId], message.channel.id, `reset_${usage.pct}pct`);
-    return message.reply(
+    await auditLog(ctx.userId, "reset", [agentId], ctx.chatId, `reset_${usage.pct}pct`);
+    return ctx.reply(
       `\u{1F504} **${agentDisplayName(agentId)}**'s session in this channel has been reset (was at ${usage.pct}% context). Send a message to start fresh.`
     );
   }
 
-  const session = await findSessionByChannel(message.channel.id);
+  const session = await findSessionByChat(ctx.chatId, ctx.platform);
   if (!session) {
-    await auditLog(message.author.id, "reset", [], message.channel.id, "no_session");
-    return message.reply(
+    await auditLog(ctx.userId, "reset", [], ctx.chatId, "no_session");
+    return ctx.reply(
       "No OpenClaw session found for this channel. Is an agent active here?"
     );
   }
@@ -439,9 +540,9 @@ async function handleReset(message, args) {
   const name = agentDisplayName(session.agentId);
   const usage = getUsageInfo(session.entry);
   await resetSession(session);
-  await auditLog(message.author.id, "reset", [], message.channel.id, `reset_${name}_${usage.pct}pct`);
+  await auditLog(ctx.userId, "reset", [], ctx.chatId, `reset_${name}_${usage.pct}pct`);
 
-  return message.reply(
+  return ctx.reply(
     `\u{1F504} **${name}**'s session in this channel has been reset (was at ${usage.pct}% context). Send a message to start fresh.`
   );
 }
@@ -450,11 +551,11 @@ async function handleReset(message, args) {
 // !status
 // ---------------------------------------------------------------------------
 
-async function handleStatus(message, args) {
+async function handleStatus(ctx, args) {
   if (args[0] === "all") {
     const agents = await listAgentIds();
     if (agents.length === 0) {
-      return message.reply("Could not read agents directory.");
+      return ctx.reply("Could not read agents directory.");
     }
 
     const lines = [];
@@ -475,7 +576,8 @@ async function handleStatus(message, args) {
         .slice(0, 3);
 
       for (const s of sorted) {
-        const shortKey = s.key.length > 50 ? "..." + s.key.slice(-47) : s.key;
+        const shortKey =
+          s.key.length > 50 ? "..." + s.key.slice(-47) : s.key;
         lines.push(`  ${s.emoji} ${s.pct}% \u2014 \`${shortKey}\``);
       }
       if (entries.length > 3) {
@@ -483,15 +585,17 @@ async function handleStatus(message, args) {
       }
     }
 
-    lines.unshift(`\u{1F4CA} **${totalSessions} sessions across ${agents.length} agents**\n`);
-    await auditLog(message.author.id, "status", ["all"], message.channel.id, `${totalSessions}_sessions`);
-    return safeReply(message, lines.join("\n"));
+    lines.unshift(
+      `\u{1F4CA} **${totalSessions} sessions across ${agents.length} agents**\n`
+    );
+    await auditLog(ctx.userId, "status", ["all"], ctx.chatId, `${totalSessions}_sessions`);
+    return ctx.reply(lines.join("\n"));
   }
 
-  const session = await findSessionByChannel(message.channel.id);
+  const session = await findSessionByChat(ctx.chatId, ctx.platform);
   if (!session) {
-    return message.reply(
-      `No OpenClaw session found for this channel. Use \`${PREFIX}status all\` to see everything.`
+    return ctx.reply(
+      `No OpenClaw session found for this channel. Use \`${ctx.prefix}status all\` to see everything.`
     );
   }
 
@@ -501,7 +605,9 @@ async function handleStatus(message, args) {
   const modelProvider = session.entry.modelProvider || "";
   const fullModel = modelProvider ? `${modelProvider}/${model}` : model;
   const alias = await resolveModelAlias(fullModel);
-  const modelDisplay = alias ? `\`${fullModel}\` (${alias})` : `\`${fullModel}\``;
+  const modelDisplay = alias
+    ? `\`${fullModel}\` (${alias})`
+    : `\`${fullModel}\``;
   const override = session.entry.modelOverride;
   const overrideNote = override ? ` *(override active)*` : "";
   const updatedAt = session.entry.updatedAt
@@ -511,15 +617,15 @@ async function handleStatus(message, args) {
       })
     : "unknown";
 
-  await auditLog(message.author.id, "status", [], message.channel.id, `${name}_${usage.pct}pct`);
-  return message.reply(
+  await auditLog(ctx.userId, "status", [], ctx.chatId, `${name}_${usage.pct}pct`);
+  return ctx.reply(
     [
       `${usage.emoji} **${name}** in this channel`,
       `Context: **${usage.pct}%** (${(usage.total / 1000).toFixed(0)}k / ${(usage.context / 1000).toFixed(0)}k tokens)`,
       `Model: ${modelDisplay}${overrideNote}`,
       `Last active: ${updatedAt}`,
       usage.pct >= 70
-        ? `\n\u26A0\uFE0F Context is getting full. Use \`${PREFIX}reset\` to clear it.`
+        ? `\n\u26A0\uFE0F Context is getting full. Use \`${ctx.prefix}reset\` to clear it.`
         : "",
     ]
       .filter(Boolean)
@@ -531,16 +637,16 @@ async function handleStatus(message, args) {
 // !start
 // ---------------------------------------------------------------------------
 
-async function handleStart(message, args) {
+async function handleStart(ctx, args) {
   if (args.length === 0) {
-    return message.reply(
-      `Usage: \`${PREFIX}start <message>\` \u2014 sends a prompt to the agent in this channel.`
+    return ctx.reply(
+      `Usage: \`${ctx.prefix}start <message>\` \u2014 sends a prompt to the agent in this channel.`
     );
   }
 
-  const session = await findSessionByChannel(message.channel.id);
+  const session = await findSessionByChat(ctx.chatId, ctx.platform);
   if (!session) {
-    return message.reply(
+    return ctx.reply(
       "No OpenClaw session found for this channel. Is an agent active here?"
     );
   }
@@ -548,20 +654,24 @@ async function handleStart(message, args) {
   const prompt = args.join(" ");
   const name = agentName(session.agentId);
 
-  await message.reply(`\u{1F4AC} Sending to **${name}**...`);
-  await auditLog(message.author.id, "start", args, message.channel.id, `session:${session.key}`);
+  await ctx.reply(`\u{1F4AC} Sending to **${name}**...`);
+  await auditLog(ctx.userId, "start", args, ctx.chatId, `session:${session.key}`);
 
-  // Try to find the ask-watson bridge script (optional — works without it)
   const bridgeScript = path.join(
-    os.homedir(), ".claude", "skills", "ask-watson", "scripts", "ask-watson.js"
+    os.homedir(),
+    ".claude",
+    "skills",
+    "ask-watson",
+    "scripts",
+    "ask-watson.js"
   );
 
   try {
     await fsp.access(bridgeScript);
   } catch {
-    return message.channel.send(
+    return ctx.send(
       `\u{274C} Bridge script not found at \`${bridgeScript}\`. ` +
-      `Set up the OpenClaw bridge to use \`${PREFIX}start\`.`
+        `Set up the OpenClaw bridge to use \`${ctx.prefix}start\`.`
     );
   }
 
@@ -570,11 +680,11 @@ async function handleStart(message, args) {
     [bridgeScript, "send", session.key, prompt],
     { timeout: 120000 },
     async (err) => {
-      if (err && err.killed) return; // Timeout is fine — agent is processing
+      if (err && err.killed) return;
       if (err) {
         console.error(`[rescue] !start send error:`, err.message);
         try {
-          await message.channel.send(
+          await ctx.send(
             `\u{274C} Failed to reach ${name} \u2014 gateway may be down.`
           );
         } catch {
@@ -589,40 +699,39 @@ async function handleStart(message, args) {
 // !restart gateway
 // ---------------------------------------------------------------------------
 
-async function handleRestart(message, args) {
+async function handleRestart(ctx, args) {
   const target = args[0]?.toLowerCase();
 
   if (target !== "gateway") {
-    return message.reply(`Usage: \`${PREFIX}restart gateway\``);
+    return ctx.reply(`Usage: \`${ctx.prefix}restart gateway\``);
   }
 
-  await message.reply(
+  await ctx.reply(
     "\u{1F504} Restarting OpenClaw gateway (clears provider cooldowns)..."
   );
-  await auditLog(message.author.id, "restart", ["gateway"], message.channel.id, "initiated");
+  await auditLog(ctx.userId, "restart", ["gateway"], ctx.chatId, "initiated");
 
   exec("pkill -f openclaw-gateway", async (err) => {
     if (err && err.code !== 1) {
-      await message.channel.send(
+      await ctx.send(
         `\u{274C} Could not kill gateway process: ${err.message}`
       );
-      await auditLog(message.author.id, "restart", ["gateway"], message.channel.id, `error: ${err.message}`);
+      await auditLog(ctx.userId, "restart", ["gateway"], ctx.chatId, `error: ${err.message}`);
       return;
     }
 
     setTimeout(async () => {
       try {
-        // Quick health check — try to read config to confirm gateway dir exists
         await fsp.access(CONFIG_PATH);
-        await message.channel.send(
-          `\u{2705} Gateway killed — launchd should auto-restart it. Use \`${PREFIX}status all\` to verify.`
+        await ctx.send(
+          `\u{2705} Gateway killed \u2014 launchd should auto-restart it. Use \`${ctx.prefix}status all\` to verify.`
         );
-        await auditLog(message.author.id, "restart", ["gateway"], message.channel.id, "success");
+        await auditLog(ctx.userId, "restart", ["gateway"], ctx.chatId, "success");
       } catch {
-        await message.channel.send(
+        await ctx.send(
           "\u{26A0}\uFE0F Gateway killed but config not found. Check your OpenClaw installation."
         );
-        await auditLog(message.author.id, "restart", ["gateway"], message.channel.id, "config_missing");
+        await auditLog(ctx.userId, "restart", ["gateway"], ctx.chatId, "config_missing");
       }
     }, 5000);
   });
@@ -671,7 +780,7 @@ async function resolveModelAlias(fullName) {
   return null;
 }
 
-async function handleModel(message, args) {
+async function handleModel(ctx, args) {
   const { aliases, models } = await loadModelAliases();
 
   if (args.length === 0) {
@@ -680,12 +789,13 @@ async function handleModel(message, args) {
       if (!modelConfig.alias) continue;
       aliasLines.push(`  \`${modelConfig.alias}\` \u2192 \`${fullName}\``);
     }
-    const list = aliasLines.length > 0
-      ? `\n\n**Available models:**\n${aliasLines.join("\n")}`
-      : "";
-    return message.reply(
-      `**Usage:** \`${PREFIX}model <alias|name>\` or \`${PREFIX}model show\` or \`${PREFIX}model default\`` +
-      list
+    const list =
+      aliasLines.length > 0
+        ? `\n\n**Available models:**\n${aliasLines.join("\n")}`
+        : "";
+    return ctx.reply(
+      `**Usage:** \`${ctx.prefix}model <alias|name>\` or \`${ctx.prefix}model show\` or \`${ctx.prefix}model default\`` +
+        list
     );
   }
 
@@ -693,76 +803,79 @@ async function handleModel(message, args) {
 
   // !model show
   if (input === "show" || input === "current") {
-    const session = await findSessionByChannel(message.channel.id);
+    const session = await findSessionByChat(ctx.chatId, ctx.platform);
     if (!session) {
-      return message.reply("No OpenClaw session found for this channel.");
+      return ctx.reply("No OpenClaw session found for this channel.");
     }
     const override = session.entry.modelOverride;
     const providerOv = session.entry.providerOverride;
     if (!override) {
-      return message.reply("No model override set \u2014 using agent default.");
+      return ctx.reply("No model override set \u2014 using agent default.");
     }
     const fullName = providerOv ? `${providerOv}/${override}` : override;
-    const alias = await resolveModelAlias(fullName);
-    return message.reply(
-      `Current override: \`${fullName}\`${alias ? ` (${alias})` : ""}\n` +
-      `Use \`${PREFIX}model default\` to clear.`
+    const resolvedAlias = await resolveModelAlias(fullName);
+    return ctx.reply(
+      `Current override: \`${fullName}\`${resolvedAlias ? ` (${resolvedAlias})` : ""}\n` +
+        `Use \`${ctx.prefix}model default\` to clear.`
     );
   }
 
   // !model default
   if (input === "default" || input === "clear" || input === "reset") {
-    const session = await findSessionByChannel(message.channel.id);
+    const session = await findSessionByChat(ctx.chatId, ctx.platform);
     if (!session) {
-      return message.reply("No OpenClaw session found for this channel.");
+      return ctx.reply("No OpenClaw session found for this channel.");
     }
     try {
       const preCheck = await readSessionsJson(session.agentId);
       if (!preCheck || !preCheck.data[session.key]) {
-        return message.reply("Session entry not found.");
+        return ctx.reply("Session entry not found.");
       }
       const { filePath } = preCheck;
       const lock = await acquireLock(filePath);
       try {
         const freshRaw = await fsp.readFile(filePath, "utf-8");
         const data = JSON.parse(freshRaw);
-        if (!data[session.key]) return message.reply("Session disappeared.");
+        if (!data[session.key]) return ctx.reply("Session disappeared.");
         const old = data[session.key].modelOverride || "(none)";
         delete data[session.key].modelOverride;
         delete data[session.key].providerOverride;
         const tmpFile = filePath + ".tmp";
         await fsp.writeFile(tmpFile, JSON.stringify(data, null, 2));
         await fsp.rename(tmpFile, filePath);
-        await message.reply(
+        await ctx.reply(
           `Model override cleared (was: \`${old}\`). Using agent default on next message.`
         );
-        await auditLog(message.author.id, "model", ["default"], message.channel.id, `${old} -> default`);
+        await auditLog(ctx.userId, "model", ["default"], ctx.chatId, `${old} -> default`);
       } finally {
         await releaseLock(lock);
       }
     } catch (err) {
-      await message.reply(`Error clearing override: ${err.message}`);
+      await ctx.reply(`Error clearing override: ${err.message}`);
     }
     return;
   }
 
   // !model <name>
-  const session = await findSessionByChannel(message.channel.id);
+  const session = await findSessionByChat(ctx.chatId, ctx.platform);
   if (!session) {
-    return message.reply(
+    return ctx.reply(
       "No OpenClaw session found for this channel. Is an agent active here?"
     );
   }
 
   let modelName = aliases[input] || input;
 
-  if (!models[modelName] && !/^[a-z0-9][a-z0-9/_.-]*[a-z0-9]$/.test(modelName)) {
+  if (
+    !models[modelName] &&
+    !/^[a-z0-9][a-z0-9/_.-]*[a-z0-9]$/.test(modelName)
+  ) {
     const suggestions = Object.entries(aliases)
       .filter(([alias]) => alias.includes(input.split("-")[0]))
       .slice(0, 3)
       .map(([alias]) => `\`${alias}\``)
       .join(", ");
-    return message.reply(
+    return ctx.reply(
       `Unknown model: \`${input}\`${suggestions ? `\nDid you mean: ${suggestions}?` : ""}`
     );
   }
@@ -772,10 +885,12 @@ async function handleModel(message, args) {
   try {
     const preCheck = await readSessionsJson(session.agentId);
     if (!preCheck) {
-      return message.reply("Could not read session data. Try again in a moment.");
+      return ctx.reply(
+        "Could not read session data. Try again in a moment."
+      );
     }
     if (!preCheck.data[session.key]) {
-      return message.reply(
+      return ctx.reply(
         "Session entry not found. Try sending a message first to initialize the session."
       );
     }
@@ -787,7 +902,7 @@ async function handleModel(message, args) {
       const freshRaw = await fsp.readFile(filePath, "utf-8");
       const data = JSON.parse(freshRaw);
       if (!data[session.key]) {
-        return message.reply("Session disappeared. Try again.");
+        return ctx.reply("Session disappeared. Try again.");
       }
 
       const oldOverride = data[session.key].modelOverride;
@@ -816,21 +931,21 @@ async function handleModel(message, args) {
     const displayName = resolvedAlias
       ? `\`${modelName}\` (${resolvedAlias})`
       : `\`${modelName}\``;
-    await message.reply(
+    await ctx.reply(
       `\u{1F504} Model override set to ${displayName}\n` +
-      `Previous: ${oldModel}\n` +
-      `This will take effect on the next message.`
+        `Previous: ${oldModel}\n` +
+        `This will take effect on the next message.`
     );
-    await auditLog(message.author.id, "model", [modelName], message.channel.id, `${oldModel} -> ${modelName}`);
+    await auditLog(ctx.userId, "model", [modelName], ctx.chatId, `${oldModel} -> ${modelName}`);
   } catch (err) {
     console.error(`[rescue] !model error:`, err.message);
-    await message.reply(`\u{274C} Error setting model: ${err.message}`);
-    await auditLog(message.author.id, "model", args, message.channel.id, `error: ${err.message}`);
+    await ctx.reply(`\u{274C} Error setting model: ${err.message}`);
+    await auditLog(ctx.userId, "model", args, ctx.chatId, `error: ${err.message}`);
   }
 }
 
 // ---------------------------------------------------------------------------
-// !mute / !unmute
+// !mute / !unmute (Discord only — modifies Discord-specific gateway config)
 // ---------------------------------------------------------------------------
 
 async function readConfig() {
@@ -845,7 +960,6 @@ async function writeConfig(config) {
 }
 
 function findDiscordAccount(config, agentId) {
-  // Check if this agent is the default (no explicit binding)
   const defaultAgentId = config.agents?.defaults?.agentId || "main";
   if (agentId === defaultAgentId) return "default";
   const binding = (config.bindings || []).find(
@@ -854,8 +968,15 @@ function findDiscordAccount(config, agentId) {
   return binding?.match?.accountId || null;
 }
 
-async function handleMute(message, args, mute) {
-  const channelId = message.channel.id;
+async function handleMute(ctx, args, mute) {
+  // Discord only
+  if (ctx.platform !== "discord") {
+    return ctx.reply(
+      `\`${ctx.prefix}${mute ? "mute" : "unmute"}\` is only available on Discord.`
+    );
+  }
+
+  const channelId = ctx.chatId;
   const verb = mute ? "Mute" : "Unmute";
   const pastVerb = mute ? "Muted" : "Unmuted";
 
@@ -864,30 +985,30 @@ async function handleMute(message, args, mute) {
     agentId = await resolveAgentId(args[0]);
     if (!agentId) {
       const list = await formatAgentList();
-      return message.reply(`Agent \`${args[0]}\` not found. Available: ${list}`);
+      return ctx.reply(
+        `Agent \`${args[0]}\` not found. Available: ${list}`
+      );
     }
   } else {
-    const session = await findSessionByChannel(channelId);
+    const session = await findSessionByChat(channelId, ctx.platform);
     agentId = session?.agentId || "main";
   }
 
   const accountId = findDiscordAccount(await readConfig(), agentId);
   if (!accountId) {
-    return message.reply(
+    return ctx.reply(
       `Could not find Discord account for **${agentDisplayName(agentId)}**.`
     );
   }
 
-  await message.reply(
+  await ctx.reply(
     `\u{1F504} ${verb === "Mute" ? "Muting" : "Unmuting"} **${agentDisplayName(agentId)}** in this channel...`
   );
-  await auditLog(message.author.id, mute ? "mute" : "unmute", [agentId], channelId, "initiated");
+  await auditLog(ctx.userId, mute ? "mute" : "unmute", [agentId], channelId, "initiated");
 
   try {
-    // Auto-backup config before modifying it
     await createBackup("pre-" + (mute ? "mute" : "unmute"));
 
-    // Kill gateway first to avoid race condition on config writes
     await new Promise((resolve) =>
       exec("pkill -f openclaw-gateway", () => resolve())
     );
@@ -896,7 +1017,7 @@ async function handleMute(message, args, mute) {
     const config = await readConfig();
     const account = config.channels?.discord?.accounts?.[accountId];
     if (!account) {
-      return message.channel.send(
+      return ctx.send(
         `\u{274C} Discord account \`${accountId}\` not found in config.`
       );
     }
@@ -912,7 +1033,7 @@ async function handleMute(message, args, mute) {
     }
 
     if (!found) {
-      return message.channel.send(
+      return ctx.send(
         `\u{274C} Channel \`${channelId}\` not configured for **${agentDisplayName(agentId)}**'s Discord account.`
       );
     }
@@ -921,19 +1042,22 @@ async function handleMute(message, args, mute) {
 
     setTimeout(async () => {
       try {
-        await message.channel.send(
+        await ctx.send(
           `\u{2705} **${pastVerb}** ${agentDisplayName(agentId)} in this channel. ` +
-          `${mute ? "They now require an @mention to respond." : "They will respond to all messages."}`
+            `${mute ? "They now require an @mention to respond." : "They will respond to all messages."}`
         );
-        await auditLog(message.author.id, mute ? "mute" : "unmute", [agentId], channelId, "success");
+        await auditLog(ctx.userId, mute ? "mute" : "unmute", [agentId], channelId, "success");
       } catch {
         /* channel unavailable */
       }
     }, 6000);
   } catch (err) {
-    console.error(`[rescue] !${mute ? "mute" : "unmute"} error:`, err.message);
-    await message.channel.send(`\u{274C} Error: ${err.message}`);
-    await auditLog(message.author.id, mute ? "mute" : "unmute", [agentId], channelId, `error: ${err.message}`);
+    console.error(
+      `[rescue] !${mute ? "mute" : "unmute"} error:`,
+      err.message
+    );
+    await ctx.send(`\u{274C} Error: ${err.message}`);
+    await auditLog(ctx.userId, mute ? "mute" : "unmute", [agentId], channelId, `error: ${err.message}`);
   }
 }
 
@@ -941,11 +1065,13 @@ async function handleMute(message, args, mute) {
 // !keys status
 // ---------------------------------------------------------------------------
 
-async function handleKeys(message, args) {
+async function handleKeys(ctx, args) {
   const sub = args[0]?.toLowerCase();
 
   if (sub !== "status") {
-    return message.reply(`Usage: \`${PREFIX}keys status\` \u2014 Show auth-profile health`);
+    return ctx.reply(
+      `Usage: \`${ctx.prefix}keys status\` \u2014 Show auth-profile health`
+    );
   }
 
   const agents = await listAgentIds();
@@ -954,7 +1080,12 @@ async function handleKeys(message, args) {
 
   for (const agentId of agents.sort()) {
     if (!isValidAgentId(agentId)) continue;
-    const authPath = path.join(AGENTS_DIR, agentId, "agent", "auth-profiles.json");
+    const authPath = path.join(
+      AGENTS_DIR,
+      agentId,
+      "agent",
+      "auth-profiles.json"
+    );
     try {
       const raw = await fsp.readFile(authPath, "utf-8");
       const data = JSON.parse(raw);
@@ -994,12 +1125,12 @@ async function handleKeys(message, args) {
       ? `\u{1F511} **Auth Profile Status** \u2014 ${totalIssues} issue${totalIssues !== 1 ? "s" : ""} found\n`
       : `\u{1F511} **Auth Profile Status** \u2014 all healthy\n`;
 
-  await auditLog(message.author.id, "keys", ["status"], message.channel.id, `${totalIssues}_issues`);
-  return safeReply(message, header + lines.join("\n"));
+  await auditLog(ctx.userId, "keys", ["status"], ctx.chatId, `${totalIssues}_issues`);
+  return ctx.reply(header + lines.join("\n"));
 }
 
 // ---------------------------------------------------------------------------
-// !backup — snapshot openclaw.json
+// !backup
 // ---------------------------------------------------------------------------
 
 async function createBackup(label) {
@@ -1015,7 +1146,6 @@ async function createBackup(label) {
   const dest = path.join(BACKUP_DIR, filename);
   await fsp.copyFile(CONFIG_PATH, dest);
 
-  // Prune old backups beyond MAX_BACKUPS
   const files = await fsp.readdir(BACKUP_DIR);
   const backups = files
     .filter((f) => f.startsWith("openclaw.json."))
@@ -1028,40 +1158,39 @@ async function createBackup(label) {
   return { filename, dest, total: Math.min(backups.length, MAX_BACKUPS) };
 }
 
-async function handleBackup(message) {
+async function handleBackup(ctx) {
   try {
     await fsp.access(CONFIG_PATH);
   } catch {
-    return message.reply(
+    return ctx.reply(
       `\u{274C} Config not found at \`${CONFIG_PATH}\`. Is OpenClaw installed?`
     );
   }
 
   try {
-    // Validate JSON before backing up (don't back up broken configs)
     const raw = await fsp.readFile(CONFIG_PATH, "utf-8");
     JSON.parse(raw);
 
     const { filename, total } = await createBackup("manual");
 
-    await message.reply(
+    await ctx.reply(
       `\u{2705} Config backed up as \`${filename}\`\n` +
-      `${total} backup${total !== 1 ? "s" : ""} stored in \`${BACKUP_DIR}/\``
+        `${total} backup${total !== 1 ? "s" : ""} stored in \`${BACKUP_DIR}/\``
     );
-    await auditLog(message.author.id, "backup", [], message.channel.id, filename);
+    await auditLog(ctx.userId, "backup", [], ctx.chatId, filename);
   } catch (err) {
     if (err instanceof SyntaxError) {
-      return message.reply(
+      return ctx.reply(
         `\u{26A0}\uFE0F Current config has invalid JSON \u2014 backing up anyway as a record.`
       );
     }
-    await message.reply(`\u{274C} Backup failed: ${err.message}`);
-    await auditLog(message.author.id, "backup", [], message.channel.id, `error: ${err.message}`);
+    await ctx.reply(`\u{274C} Backup failed: ${err.message}`);
+    await auditLog(ctx.userId, "backup", [], ctx.chatId, `error: ${err.message}`);
   }
 }
 
 // ---------------------------------------------------------------------------
-// !rollback — restore last known good config + restart gateway
+// !rollback
 // ---------------------------------------------------------------------------
 
 async function listBackups() {
@@ -1076,109 +1205,96 @@ async function listBackups() {
   }
 }
 
-async function handleRollback(message, args) {
+async function handleRollback(ctx, args) {
   const sub = args[0]?.toLowerCase();
   const backups = await listBackups();
 
   if (backups.length === 0) {
-    return message.reply(
+    return ctx.reply(
       `No backups found in \`${BACKUP_DIR}/\`.\n` +
-      `Use \`${PREFIX}backup\` to create one first.`
+        `Use \`${ctx.prefix}backup\` to create one first.`
     );
   }
 
-  // !rollback list — show recent backups
   if (sub === "list") {
     const recent = backups.slice(0, 10);
     const lines = recent.map((f, i) => {
       const label = i === 0 ? " **(latest)**" : "";
       return `  \`${f}\`${label}`;
     });
-    await auditLog(message.author.id, "rollback", ["list"], message.channel.id, `${backups.length}_backups`);
-    return message.reply(
+    await auditLog(ctx.userId, "rollback", ["list"], ctx.chatId, `${backups.length}_backups`);
+    return ctx.reply(
       `\u{1F4CB} **${backups.length} backups available:**\n${lines.join("\n")}\n\n` +
-      `Use \`${PREFIX}rollback\` to restore the latest, or \`${PREFIX}rollback <filename>\` for a specific one.`
+        `Use \`${ctx.prefix}rollback\` to restore the latest, or \`${ctx.prefix}rollback <filename>\` for a specific one.`
     );
   }
 
-  // Determine which backup to restore
   let targetFile;
   if (!sub) {
-    // Default: latest backup
     targetFile = backups[0];
   } else {
-    // Specific backup by filename (or partial match)
-    targetFile = backups.find(
-      (f) => f === sub || f.includes(sub)
-    );
+    targetFile = backups.find((f) => f === sub || f.includes(sub));
     if (!targetFile) {
-      return message.reply(
-        `Backup \`${sub}\` not found. Use \`${PREFIX}rollback list\` to see available backups.`
+      return ctx.reply(
+        `Backup \`${sub}\` not found. Use \`${ctx.prefix}rollback list\` to see available backups.`
       );
     }
   }
 
   const backupPath = path.join(BACKUP_DIR, targetFile);
 
-  // Validate the backup is valid JSON before restoring
   try {
     const raw = await fsp.readFile(backupPath, "utf-8");
     JSON.parse(raw);
   } catch {
-    return message.reply(
+    return ctx.reply(
       `\u{274C} Backup \`${targetFile}\` contains invalid JSON. Try a different backup.`
     );
   }
 
-  await message.reply(
+  await ctx.reply(
     `\u{1F504} Rolling back to \`${targetFile}\`...\n` +
-    `1. Backing up current config\n` +
-    `2. Stopping gateway\n` +
-    `3. Restoring backup\n` +
-    `4. Restarting gateway`
+      `1. Backing up current config\n` +
+      `2. Stopping gateway\n` +
+      `3. Restoring backup\n` +
+      `4. Restarting gateway`
   );
 
   try {
-    // Step 1: Backup current config before overwriting
     await createBackup("pre-rollback");
 
-    // Step 2: Kill gateway
     await new Promise((resolve) =>
       exec("pkill -f openclaw-gateway", () => resolve())
     );
     await new Promise((r) => setTimeout(r, 2000));
 
-    // Step 3: Restore the backup (atomic: copy to tmp, rename)
     const tmpFile = CONFIG_PATH + ".tmp";
     await fsp.copyFile(backupPath, tmpFile);
     await fsp.rename(tmpFile, CONFIG_PATH);
 
-    // Step 4: Gateway auto-restarts via launchd (KeepAlive=true)
-    // Wait a moment and confirm
     setTimeout(async () => {
       try {
-        // Verify the config is readable
         const raw = await fsp.readFile(CONFIG_PATH, "utf-8");
         const config = JSON.parse(raw);
         const agentCount = Object.keys(config.agents?.agents || {}).length;
-        await message.channel.send(
+        await ctx.send(
           `\u{2705} **Rollback complete!** Restored \`${targetFile}\`\n` +
-          `Config has ${agentCount} agent${agentCount !== 1 ? "s" : ""} configured. ` +
-          `Gateway should auto-restart via launchd.`
+            `Config has ${agentCount} agent${agentCount !== 1 ? "s" : ""} configured. ` +
+            `Gateway should auto-restart via launchd.`
         );
-        await auditLog(message.author.id, "rollback", [targetFile], message.channel.id, "success");
+        await auditLog(ctx.userId, "rollback", [targetFile], ctx.chatId, "success");
       } catch (err) {
-        await message.channel.send(
+        await ctx.send(
           `\u{26A0}\uFE0F Config restored but verification failed: ${err.message}\n` +
-          `The gateway may need manual attention.`
+            `The gateway may need manual attention.`
         );
-        await auditLog(message.author.id, "rollback", [targetFile], message.channel.id, `verify_error: ${err.message}`);
+        await auditLog(ctx.userId, "rollback", [targetFile], ctx.chatId, `verify_error: ${err.message}`);
       }
     }, 6000);
   } catch (err) {
     console.error("[rescue] !rollback error:", err.message);
-    await message.channel.send(`\u{274C} Rollback failed: ${err.message}`);
-    await auditLog(message.author.id, "rollback", [targetFile], message.channel.id, `error: ${err.message}`);
+    await ctx.send(`\u{274C} Rollback failed: ${err.message}`);
+    await auditLog(ctx.userId, "rollback", [targetFile], ctx.chatId, `error: ${err.message}`);
   }
 }
 
@@ -1186,40 +1302,48 @@ async function handleRollback(message, args) {
 // !help
 // ---------------------------------------------------------------------------
 
-async function handleHelp(message) {
+async function handleHelp(ctx) {
+  const p = ctx.prefix;
   const aliasEntries = Object.entries(AGENT_ALIASES);
   const aliasLine =
     aliasEntries.length > 0
       ? `\n_Agent aliases: ${aliasEntries.map(([a, id]) => `\`${a}\`\u2192\`${id}\``).join(", ")}_`
       : "";
 
-  return message.reply(
+  const discordOnly =
+    ctx.platform === "discord"
+      ? [
+          `\`${p}mute [agent]\` \u2014 Require @mention for agent in this channel`,
+          `\`${p}unmute [agent]\` \u2014 Let agent respond to all messages`,
+        ]
+      : [];
+
+  return ctx.reply(
     [
       "**Rescue \u2014 OpenClaw Admin Bot**",
       "",
       "**Session Management**",
-      `\`${PREFIX}reset\` \u2014 Reset the agent session in this channel`,
-      `\`${PREFIX}reset <agent>\` \u2014 Reset agent's session in this channel`,
-      `\`${PREFIX}reset <agent> all\` \u2014 Reset ALL sessions for an agent everywhere`,
-      `\`${PREFIX}status\` \u2014 Show session health for this channel`,
-      `\`${PREFIX}status all\` \u2014 Show all sessions across all agents`,
-      `\`${PREFIX}start <message>\` \u2014 Kick off a conversation with the agent`,
+      `\`${p}reset\` \u2014 Reset the agent session in this channel`,
+      `\`${p}reset <agent>\` \u2014 Reset agent's session in this channel`,
+      `\`${p}reset <agent> all\` \u2014 Reset ALL sessions for an agent everywhere`,
+      `\`${p}status\` \u2014 Show session health for this channel`,
+      `\`${p}status all\` \u2014 Show all sessions across all agents`,
+      `\`${p}start <message>\` \u2014 Kick off a conversation with the agent`,
       "",
       "**Model & Config**",
-      `\`${PREFIX}model <alias|name>\` \u2014 Override model for this session`,
-      `\`${PREFIX}model show\` \u2014 Show current model override`,
-      `\`${PREFIX}model default\` \u2014 Clear model override`,
-      `\`${PREFIX}mute [agent]\` \u2014 Require @mention for agent in this channel`,
-      `\`${PREFIX}unmute [agent]\` \u2014 Let agent respond to all messages`,
+      `\`${p}model <alias|name>\` \u2014 Override model for this session`,
+      `\`${p}model show\` \u2014 Show current model override`,
+      `\`${p}model default\` \u2014 Clear model override`,
+      ...discordOnly,
       "",
       "**System**",
-      `\`${PREFIX}restart gateway\` \u2014 Restart the OpenClaw gateway`,
-      `\`${PREFIX}keys status\` \u2014 Show auth-profile health`,
-      `\`${PREFIX}backup\` \u2014 Snapshot the current gateway config`,
-      `\`${PREFIX}rollback\` \u2014 Restore the last known good config`,
-      `\`${PREFIX}rollback list\` \u2014 Show available config backups`,
-      `\`${PREFIX}watchdog\` \u2014 Show gateway health and restart history`,
-      `\`${PREFIX}help\` \u2014 This message`,
+      `\`${p}restart gateway\` \u2014 Restart the OpenClaw gateway`,
+      `\`${p}keys status\` \u2014 Show auth-profile health`,
+      `\`${p}backup\` \u2014 Snapshot the current gateway config`,
+      `\`${p}rollback\` \u2014 Restore the last known good config`,
+      `\`${p}rollback list\` \u2014 Show available config backups`,
+      `\`${p}watchdog\` \u2014 Show gateway health and restart history`,
+      `\`${p}help\` \u2014 This message`,
       aliasLine,
     ]
       .filter(Boolean)
@@ -1228,7 +1352,7 @@ async function handleHelp(message) {
 }
 
 // ---------------------------------------------------------------------------
-// Stall detector — alerts when an agent hasn't responded in STALL_THRESHOLD_MS
+// Stall detector
 // ---------------------------------------------------------------------------
 
 async function readLastMessageRole(agentId, entry) {
@@ -1273,7 +1397,6 @@ async function checkForStalledSessions() {
   const agents = await listAgentIds();
   const now = Date.now();
 
-  // Prune stale entries
   for (const [key, time] of staleAlertTimes) {
     if (now - time > STALL_ALERT_COOLDOWN * 2) staleAlertTimes.delete(key);
   }
@@ -1283,7 +1406,10 @@ async function checkForStalledSessions() {
     if (!result) continue;
 
     for (const [key, entry] of Object.entries(result.data)) {
-      if (!key.includes("discord:channel:")) continue;
+      // Support both Discord and Telegram session keys
+      const discordMatch = key.match(/discord:channel:(\d+)/);
+      const telegramMatch = key.match(/telegram:chat:(-?\d+)/);
+      if (!discordMatch && !telegramMatch) continue;
 
       const updatedAt = entry.updatedAt || 0;
       const timeSinceUpdate = now - updatedAt;
@@ -1297,44 +1423,69 @@ async function checkForStalledSessions() {
       const lastRole = await readLastMessageRole(agentId, entry);
       if (lastRole !== "user") continue;
 
-      const channelMatch = key.match(/discord:channel:(\d+)/);
-      if (!channelMatch) continue;
-      const channelId = channelMatch[1];
+      const name = agentName(agentId);
+      const minutes = Math.round(timeSinceUpdate / 60000);
+      const usage = getUsageInfo(entry);
 
-      try {
-        const channel = await client.channels.fetch(channelId);
-        if (!channel?.isTextBased()) continue;
+      const alertText =
+        `\u{1F6A8} **Stall detected:** ${name} hasn't responded in ${minutes} minutes (context: ${usage.pct}%). Use \`!reset\` to clear the session.`;
 
-        const name = agentName(agentId);
-        const minutes = Math.round(timeSinceUpdate / 60000);
-        const usage = getUsageInfo(entry);
-
-        await channel.send(
-          `\u{1F6A8} **Stall detected:** ${name} hasn't responded in ${minutes} minutes (context: ${usage.pct}%). Use \`${PREFIX}reset\` to clear the session.`
-        );
-
-        staleAlertTimes.set(key, now);
-        await auditLog("system", "stall_alert", [agentId, key], channelId, `${minutes}min_${usage.pct}pct`);
-      } catch (err) {
-        console.error(`[rescue] Stall alert failed for ${key}:`, err.message);
+      // Alert via Discord
+      if (discordMatch && discordClient) {
+        const channelId = discordMatch[1];
+        try {
+          const channel = await discordClient.channels.fetch(channelId);
+          if (channel?.isTextBased()) {
+            await channel.send(alertText);
+          }
+        } catch (err) {
+          console.error(
+            `[rescue] Stall alert failed for ${key}:`,
+            err.message
+          );
+        }
       }
+
+      // Alert via Telegram
+      if (telegramMatch && telegramBot) {
+        const chatId = telegramMatch[1];
+        try {
+          await telegramBot.api.sendMessage(chatId, alertText);
+        } catch (err) {
+          console.error(
+            `[rescue] Telegram stall alert failed for ${key}:`,
+            err.message
+          );
+        }
+      }
+
+      staleAlertTimes.set(key, now);
+      await auditLog(
+        "system",
+        "stall_alert",
+        [agentId, key],
+        discordMatch?.[1] || telegramMatch?.[1] || "unknown",
+        `${minutes}min_${usage.pct}pct`
+      );
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Gateway watchdog — crash-loop detection and alerting
+// Gateway watchdog
 // ---------------------------------------------------------------------------
 
-/** Get the current gateway PID, or null if not running. */
 function getGatewayPid() {
   return new Promise((resolve) => {
-    exec(`pgrep -f "${GATEWAY_PROCESS_NAME}"`, { timeout: 5000 }, (err, stdout) => {
-      if (err) return resolve(null); // Not running or pgrep failed
-      const pids = stdout.trim().split("\n").filter(Boolean);
-      // Return the first PID (there should only be one gateway)
-      resolve(pids.length > 0 ? parseInt(pids[0], 10) : null);
-    });
+    exec(
+      `pgrep -f "${GATEWAY_PROCESS_NAME}"`,
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const pids = stdout.trim().split("\n").filter(Boolean);
+        resolve(pids.length > 0 ? parseInt(pids[0], 10) : null);
+      }
+    );
   });
 }
 
@@ -1344,12 +1495,9 @@ async function checkGatewayHealth() {
 
   const pid = await getGatewayPid();
 
-  // Gateway is down
   if (!pid) {
     if (watchdogState.lastPid !== null) {
-      // Was running, now it's not — record a restart event
       watchdogState.restarts.push(now);
-      // Bound array to 20 entries
       if (watchdogState.restarts.length > 20) {
         watchdogState.restarts = watchdogState.restarts.slice(-20);
       }
@@ -1359,7 +1507,6 @@ async function checkGatewayHealth() {
     return;
   }
 
-  // Gateway is running — check if PID changed (restart detected)
   if (watchdogState.lastPid !== null && pid !== watchdogState.lastPid) {
     watchdogState.restarts.push(now);
     if (watchdogState.restarts.length > 20) {
@@ -1369,13 +1516,11 @@ async function checkGatewayHealth() {
 
   watchdogState.lastPid = pid;
 
-  // Count recent restarts within the crash window
   const recentRestarts = watchdogState.restarts.filter(
     (t) => now - t < WATCHDOG_CRASH_WINDOW
   );
 
   if (recentRestarts.length >= WATCHDOG_CRASH_THRESHOLD) {
-    // Crash-loop detected — check cooldown
     if (now - watchdogState.lastAlertTime < WATCHDOG_ALERT_COOLDOWN) {
       watchdogState.status = "cooldown";
       return;
@@ -1389,19 +1534,34 @@ async function checkGatewayHealth() {
       `${recentRestarts.length} restarts in the last ${Math.round(WATCHDOG_CRASH_WINDOW / 60000)} minutes\n` +
       `Current PID: ${pid}\n\n` +
       `**Recommended actions:**\n` +
-      `\u2022 \`${PREFIX}rollback\` \u2014 restore last known good config\n` +
-      `\u2022 \`${PREFIX}rollback list\` \u2014 see available backups\n` +
+      `\u2022 \`!rollback\` \u2014 restore last known good config\n` +
+      `\u2022 \`!rollback list\` \u2014 see available backups\n` +
       `\u2022 Check gateway logs for the root cause`;
 
-    // Alert in ops channel if configured
-    if (OPS_CHANNEL_ID) {
+    // Alert via Discord ops channel
+    if (OPS_CHANNEL_ID && discordClient) {
       try {
-        const channel = await client.channels.fetch(OPS_CHANNEL_ID);
+        const channel = await discordClient.channels.fetch(OPS_CHANNEL_ID);
         if (channel?.isTextBased()) {
           await channel.send(alertMessage);
         }
       } catch (err) {
-        console.error("[rescue] Watchdog alert to ops channel failed:", err.message);
+        console.error(
+          "[rescue] Watchdog Discord alert failed:",
+          err.message
+        );
+      }
+    }
+
+    // Alert via Telegram ops chat
+    if (OPS_TELEGRAM_CHAT && telegramBot) {
+      try {
+        await telegramBot.api.sendMessage(OPS_TELEGRAM_CHAT, alertMessage);
+      } catch (err) {
+        console.error(
+          "[rescue] Watchdog Telegram alert failed:",
+          err.message
+        );
       }
     }
 
@@ -1409,7 +1569,7 @@ async function checkGatewayHealth() {
       "watchdog",
       "crash_loop_alert",
       [String(recentRestarts.length), String(pid)],
-      OPS_CHANNEL_ID || "none",
+      OPS_CHANNEL_ID || OPS_TELEGRAM_CHAT || "none",
       `${recentRestarts.length}_restarts_in_${WATCHDOG_CRASH_WINDOW / 60000}min`
     );
 
@@ -1422,8 +1582,7 @@ async function checkGatewayHealth() {
   watchdogState.status = "healthy";
 }
 
-/** Handle !watchdog command — show watchdog status. */
-async function handleWatchdog(message) {
+async function handleWatchdog(ctx) {
   const now = Date.now();
   const pid = watchdogState.lastPid;
   const recentRestarts = watchdogState.restarts.filter(
@@ -1450,7 +1609,8 @@ async function handleWatchdog(message) {
   if (watchdogState.lastAlertTime > 0) {
     const ago = Math.round((now - watchdogState.lastAlertTime) / 60000);
     lines.push(`**Last alert:** ${ago} min ago`);
-    const cooldownRemaining = WATCHDOG_ALERT_COOLDOWN - (now - watchdogState.lastAlertTime);
+    const cooldownRemaining =
+      WATCHDOG_ALERT_COOLDOWN - (now - watchdogState.lastAlertTime);
     if (cooldownRemaining > 0) {
       lines.push(
         `**Cooldown:** ${Math.round(cooldownRemaining / 60000)} min remaining`
@@ -1472,37 +1632,84 @@ async function handleWatchdog(message) {
     `_Polling every ${WATCHDOG_INTERVAL / 1000}s \u2022 Alert threshold: ${WATCHDOG_CRASH_THRESHOLD} restarts in ${WATCHDOG_CRASH_WINDOW / 60000}min_`
   );
 
-  await auditLog(message.author.id, "watchdog", [], message.channel.id, watchdogState.status);
-  return message.reply(lines.join("\n"));
+  await auditLog(ctx.userId, "watchdog", [], ctx.chatId, watchdogState.status);
+  return ctx.reply(lines.join("\n"));
 }
 
 // ---------------------------------------------------------------------------
-// Bot setup
+// Command router — shared by both platforms
 // ---------------------------------------------------------------------------
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-});
+async function routeCommand(ctx, cmd, args) {
+  if (!checkCooldown(cmd)) return;
 
-client.once("clientReady", () => {
-  console.log(`[rescue] Logged in as ${client.user.tag}`);
-  console.log(`[rescue] Authorized user: ${ADMIN_USER_ID}`);
-  console.log(`[rescue] OpenClaw dir: ${OPENCLAW_DIR}`);
-  console.log(`[rescue] Config: ${CONFIG_PATH}`);
-  console.log(`[rescue] Backups: ${BACKUP_DIR}`);
-  console.log(`[rescue] Audit log: ${AUDIT_LOG}`);
-
-  if (Object.keys(AGENT_ALIASES).length > 0) {
-    console.log(
-      `[rescue] Agent aliases: ${JSON.stringify(AGENT_ALIASES)}`
-    );
+  try {
+    switch (cmd) {
+      case "reset":
+        await handleReset(ctx, args);
+        break;
+      case "status":
+        await handleStatus(ctx, args);
+        break;
+      case "restart":
+        await handleRestart(ctx, args);
+        break;
+      case "start":
+        await handleStart(ctx, args);
+        break;
+      case "model":
+        await handleModel(ctx, args);
+        break;
+      case "keys":
+        await handleKeys(ctx, args);
+        break;
+      case "mute":
+        await handleMute(ctx, args, true);
+        break;
+      case "unmute":
+        await handleMute(ctx, args, false);
+        break;
+      case "backup":
+        await handleBackup(ctx);
+        break;
+      case "rollback":
+        await handleRollback(ctx, args);
+        break;
+      case "watchdog":
+        await handleWatchdog(ctx);
+        break;
+      case "help":
+        await handleHelp(ctx);
+        break;
+      // Silently ignore unknown commands
+    }
+  } catch (err) {
+    console.error(`[rescue] Error handling ${ctx.prefix}${cmd}:`, err);
+    await auditLog(ctx.userId, cmd, args, ctx.chatId, `error: ${err.message}`);
+    try {
+      await ctx.reply(
+        "An error occurred processing that command. Check logs for details."
+      );
+    } catch {
+      // Can't reply
+    }
   }
+}
 
-  // Start stall detection loop
+// ---------------------------------------------------------------------------
+// Platform clients
+// ---------------------------------------------------------------------------
+
+let discordClient = null;
+let telegramBot = null;
+
+/** Start background monitors (called once when first platform connects). */
+let monitorsStarted = false;
+function startMonitors() {
+  if (monitorsStarted) return;
+  monitorsStarted = true;
+
+  // Stall detector
   setInterval(() => {
     checkForStalledSessions().catch((err) => {
       console.error("[rescue] Stall check error:", err.message);
@@ -1512,95 +1719,109 @@ client.once("clientReady", () => {
     `[rescue] Stall detector active (${STALL_CHECK_INTERVAL / 1000}s interval, ${STALL_THRESHOLD_MS / 60000}min threshold)`
   );
 
-  // Start gateway watchdog
+  // Gateway watchdog
   setInterval(() => {
     checkGatewayHealth().catch((err) => {
       console.error("[rescue] Watchdog check error:", err.message);
     });
   }, WATCHDOG_INTERVAL);
-  // Run initial check immediately
   checkGatewayHealth().catch(() => {});
   console.log(
     `[rescue] Watchdog active (${WATCHDOG_INTERVAL / 1000}s interval, alert on ${WATCHDOG_CRASH_THRESHOLD}+ restarts in ${WATCHDOG_CRASH_WINDOW / 60000}min)`
   );
-});
+}
 
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (!message.content.startsWith(PREFIX)) return;
-  if (message.author.id !== ADMIN_USER_ID) return;
+// --- Discord ---
 
-  const [command, ...args] = message.content
-    .slice(PREFIX.length)
-    .trim()
-    .split(/\s+/);
+if (DISCORD_TOKEN) {
+  discordClient = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+    ],
+  });
 
-  const cmd = command.toLowerCase();
-
-  if (!checkCooldown(cmd)) return;
-
-  try {
-    switch (cmd) {
-      case "reset":
-        await handleReset(message, args);
-        break;
-      case "status":
-        await handleStatus(message, args);
-        break;
-      case "restart":
-        await handleRestart(message, args);
-        break;
-      case "start":
-        await handleStart(message, args);
-        break;
-      case "model":
-        await handleModel(message, args);
-        break;
-      case "keys":
-        await handleKeys(message, args);
-        break;
-      case "mute":
-        await handleMute(message, args, true);
-        break;
-      case "unmute":
-        await handleMute(message, args, false);
-        break;
-      case "backup":
-        await handleBackup(message);
-        break;
-      case "rollback":
-        await handleRollback(message, args);
-        break;
-      case "watchdog":
-        await handleWatchdog(message);
-        break;
-      case "help":
-        await handleHelp(message);
-        break;
-      // Silently ignore unknown commands
-    }
-  } catch (err) {
-    console.error(`[rescue] Error handling ${PREFIX}${cmd}:`, err);
-    await auditLog(message.author.id, cmd, args, message.channel.id, `error: ${err.message}`);
-    try {
-      await message.reply(
-        "An error occurred processing that command. Check logs for details."
+  discordClient.once("clientReady", () => {
+    console.log(`[rescue] Discord: logged in as ${discordClient.user.tag}`);
+    console.log(`[rescue] Discord: authorized user ${DISCORD_ADMIN_ID}`);
+    if (Object.keys(AGENT_ALIASES).length > 0) {
+      console.log(
+        `[rescue] Agent aliases: ${JSON.stringify(AGENT_ALIASES)}`
       );
-    } catch {
-      // Can't reply
     }
-  }
-});
+    startMonitors();
+  });
 
+  discordClient.on("messageCreate", async (message) => {
+    if (message.author.bot) return;
+    if (!message.content.startsWith(DISCORD_PREFIX)) return;
+    if (!DISCORD_ADMIN_ID || message.author.id !== DISCORD_ADMIN_ID) return;
+
+    const [command, ...args] = message.content
+      .slice(DISCORD_PREFIX.length)
+      .trim()
+      .split(/\s+/);
+
+    const ctx = fromDiscord(message);
+    await routeCommand(ctx, command.toLowerCase(), args);
+  });
+
+  discordClient.login(DISCORD_TOKEN).catch((err) => {
+    console.error("[rescue] Discord login failed:", err.message);
+  });
+} else {
+  console.log("[rescue] Discord: disabled (no DISCORD_BOT_TOKEN)");
+}
+
+// --- Telegram ---
+
+if (TELEGRAM_TOKEN) {
+  telegramBot = new Bot(TELEGRAM_TOKEN);
+
+  telegramBot.on("message:text", async (tgCtx) => {
+    const text = tgCtx.message.text;
+    if (!text.startsWith(TELEGRAM_PREFIX)) return;
+    if (
+      !TELEGRAM_ADMIN_ID ||
+      String(tgCtx.from?.id) !== String(TELEGRAM_ADMIN_ID)
+    )
+      return;
+
+    // Strip bot mention from commands (Telegram appends @botname)
+    let rawCmd = text.slice(TELEGRAM_PREFIX.length).trim();
+    const [commandPart, ...args] = rawCmd.split(/\s+/);
+    const cmd = commandPart.replace(/@\S+$/, "").toLowerCase();
+
+    const ctx = fromTelegram(tgCtx);
+    await routeCommand(ctx, cmd, args);
+  });
+
+  telegramBot
+    .start({
+      onStart: (botInfo) => {
+        console.log(`[rescue] Telegram: logged in as @${botInfo.username}`);
+        console.log(`[rescue] Telegram: authorized user ${TELEGRAM_ADMIN_ID}`);
+        startMonitors();
+      },
+    })
+    .catch((err) => {
+      console.error("[rescue] Telegram start failed:", err.message);
+    });
+} else {
+  console.log("[rescue] Telegram: disabled (no TELEGRAM_BOT_TOKEN)");
+}
+
+// ---------------------------------------------------------------------------
 // Graceful shutdown
+// ---------------------------------------------------------------------------
+
 function shutdown(signal) {
   console.log(`[rescue] Received ${signal}, shutting down...`);
-  client.destroy();
+  if (discordClient) discordClient.destroy();
+  if (telegramBot) telegramBot.stop();
   process.exit(0);
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-
-// Start
-client.login(BOT_TOKEN);

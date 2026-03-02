@@ -1,20 +1,20 @@
 # Rescue
 
-**Discord admin bot for [OpenClaw](https://openclaw.ai) — session management, config rollback, and crash-loop detection.**
+**Discord + Telegram admin bot for [OpenClaw](https://openclaw.ai) — session management, config rollback, and crash-loop detection.**
 
 Rescue runs independently of the OpenClaw gateway. When your gateway is down, your agents are stuck, and your config is broken — Rescue still works. That's the point.
 
-![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![Discord.js](https://img.shields.io/badge/discord.js-v14-blue) ![License](https://img.shields.io/badge/license-MIT-green)
+![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![Discord.js](https://img.shields.io/badge/discord.js-v14-blue) ![grammY](https://img.shields.io/badge/grammY-Telegram-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Why Rescue Exists
 
-OpenClaw has no built-in admin interface. When something goes wrong — an agent runs out of context, the gateway crashes from a bad config, API keys expire — you're stuck SSHing into a terminal. Rescue gives you a one-word fix from Discord:
+OpenClaw has no built-in admin interface. When something goes wrong — an agent runs out of context, the gateway crashes from a bad config, API keys expire — you're stuck SSHing into a terminal. Rescue gives you a one-word fix from Discord or Telegram:
 
 - **`!reset`** clears a stuck agent session
 - **`!rollback`** restores your last working config
 - **`!watchdog`** tells you when the gateway is crash-looping before you even notice
 
-Single file. Single dependency. Works when everything else is broken.
+Single file. Two dependencies. Works when everything else is broken.
 
 ## Quick Start
 
@@ -24,11 +24,16 @@ cd rescue-for-openclaw
 npm install
 ```
 
-Set two environment variables:
+Set your platform tokens (at least one required):
 
 ```bash
+# Discord
 export DISCORD_BOT_TOKEN="your-bot-token"
 export DISCORD_ADMIN_USER_ID="your-discord-user-id"
+
+# Telegram (optional — add to run on both platforms)
+export TELEGRAM_BOT_TOKEN="your-bot-token"
+export TELEGRAM_ADMIN_USER_ID="your-telegram-user-id"
 ```
 
 Run it:
@@ -37,11 +42,15 @@ Run it:
 node index.js
 ```
 
-That's it. Rescue will connect to Discord and start monitoring your gateway.
+That's it. Rescue connects to whichever platforms you configure and starts monitoring your gateway.
 
 > **Need a Discord bot token?** Create one at the [Discord Developer Portal](https://discord.com/developers/applications). Your bot needs `MESSAGE_CONTENT`, `GUILDS`, and `GUILD_MESSAGES` intents.
+>
+> **Need a Telegram bot token?** Message [@BotFather](https://t.me/BotFather) on Telegram. To find your user ID, message [@userinfobot](https://t.me/userinfobot).
 
 ## Commands
+
+All commands work on both Discord and Telegram. Discord uses `!` prefix by default, Telegram uses `/`. Mute/unmute is Discord-only (Telegram doesn't have the same channel permissions model).
 
 ### Session Management
 
@@ -89,14 +98,20 @@ Rescue runs two background monitors automatically:
 
 All configuration is via environment variables. Only the first two are required.
 
+At least one platform token is required. Everything else is optional.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DISCORD_BOT_TOKEN` | *required* | Discord bot token (also accepts `DISCORD_ADMIN_BOT_TOKEN`) |
-| `DISCORD_ADMIN_USER_ID` | *required* | Your Discord user ID — only you can use commands |
+| `DISCORD_BOT_TOKEN` | — | Discord bot token (also accepts `DISCORD_ADMIN_BOT_TOKEN`) |
+| `DISCORD_ADMIN_USER_ID` | — | Your Discord user ID — only you can use commands |
+| `TELEGRAM_BOT_TOKEN` | — | Telegram bot token from @BotFather |
+| `TELEGRAM_ADMIN_USER_ID` | — | Your Telegram user ID — only you can use commands |
 | `OPENCLAW_DIR` | `~/.openclaw` | Path to your OpenClaw installation |
-| `RESCUE_PREFIX` | `!` | Command prefix |
+| `RESCUE_PREFIX` | `!` | Discord command prefix |
+| `RESCUE_TELEGRAM_PREFIX` | `/` | Telegram command prefix |
 | `RESCUE_AGENT_ALIASES` | `{}` | JSON map of friendly names, e.g. `{"watson":"main"}` |
-| `RESCUE_OPS_CHANNEL_ID` | — | Channel ID for system alerts (watchdog, stalls) |
+| `RESCUE_OPS_CHANNEL_ID` | — | Discord channel ID for system alerts |
+| `RESCUE_OPS_TELEGRAM_CHAT` | — | Telegram chat ID for system alerts |
 | `RESCUE_STALL_MINUTES` | `15` | Minutes before stall alert fires |
 | `RESCUE_MAX_BACKUPS` | `20` | Config backups to keep before pruning |
 | `RESCUE_GATEWAY_PROCESS` | `openclaw-gateway` | Process name for watchdog monitoring |
@@ -175,7 +190,7 @@ It communicates with the gateway only by killing the process (`pkill`) and relyi
 
 ## Security
 
-- **Single admin** — commands are silently ignored for all users except `DISCORD_ADMIN_USER_ID`
+- **Single admin per platform** — commands are silently ignored for all users except your configured admin ID
 - **No secrets in code** — all credentials come from environment variables
 - **Path traversal protection** — agent IDs and session IDs are regex-validated before filesystem access
 - **Atomic file writes** — all config/session writes use tmp-file-then-rename to prevent corruption
@@ -187,7 +202,7 @@ It communicates with the gateway only by killing the process (`pkill`) and relyi
 
 ### Adding a command
 
-1. Write a `handleYourCommand(message, args)` function
+1. Write a `handleYourCommand(ctx, args)` function
 2. Add a cooldown to the `COOLDOWNS` map
 3. Add a `case` to the `switch` in the message handler
 4. Add a line to `handleHelp()`
@@ -204,8 +219,8 @@ export RESCUE_AGENT_ALIASES='{"watson":"main","barker":"herald"}'
 
 ```
 rescue-for-openclaw/
-├── index.js        # The entire bot — single file, ~1600 lines
-├── package.json    # Only dependency: discord.js
+├── index.js        # The entire bot — single file, ~1800 lines
+├── package.json    # Two dependencies: discord.js + grammY
 ├── LICENSE         # MIT
 └── README.md
 ```
@@ -226,7 +241,7 @@ No build step. No config files. Clone, `npm install`, run.
 
 ## Roadmap
 
-- [ ] **Telegram support** — same commands, works in Telegram groups alongside Discord
+- [x] **Telegram support** — same commands, works in Telegram groups alongside Discord
 - [ ] **Auto-rollback** (opt-in) — watchdog automatically restores last known good config on crash-loop
 - [ ] **Config diff** — `!diff` to show what changed between current config and last backup
 - [ ] **Health dashboard** — `!health` combining gateway status, session health, and API key state in one view
