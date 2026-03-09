@@ -23,6 +23,7 @@
  *   !backup             — Snapshot the current gateway config
  *   !rollback           — Restore last known good config + restart gateway
  *   !rollback list      — Show recent config backups
+ *   !cron               — Show cron job health and errors
  *   !watchdog           — Show gateway health and restart history
  *   !help               — Display command help
  *
@@ -239,6 +240,7 @@ const COOLDOWNS = {
   backup: 5000,
   rollback: 10000,
   watchdog: 2000,
+  cron: 3000,
 };
 const lastCommandTime = new Map();
 
@@ -1342,6 +1344,7 @@ async function handleHelp(ctx) {
       `\`${p}backup\` \u2014 Snapshot the current gateway config`,
       `\`${p}rollback\` \u2014 Restore the last known good config`,
       `\`${p}rollback list\` \u2014 Show available config backups`,
+      `\`${p}cron\` \u2014 Show cron job health and errors`,
       `\`${p}watchdog\` \u2014 Show gateway health and restart history`,
       `\`${p}help\` \u2014 This message`,
       aliasLine,
@@ -1582,6 +1585,76 @@ async function checkGatewayHealth() {
   watchdogState.status = "healthy";
 }
 
+async function handleCron(ctx) {
+  const cronPath = path.join(OPENCLAW_DIR, "cron", "jobs.json");
+  let jobs;
+  try {
+    const raw = await fsp.readFile(cronPath, "utf-8");
+    const data = JSON.parse(raw);
+    jobs = data.jobs || [];
+  } catch (err) {
+    await auditLog(ctx.userId, "cron", [], ctx.chatId, `error: ${err.message}`);
+    return ctx.reply(`Could not read cron jobs: ${err.message}`);
+  }
+
+  const now = Date.now();
+  const erroring = [];
+  const disabled = [];
+  const healthy = [];
+
+  for (const job of jobs) {
+    const errors = job.state?.consecutiveErrors || 0;
+    const enabled = job.enabled === true;
+    const lastStatus = job.state?.lastStatus || "unknown";
+    const lastRun = job.state?.lastRunAtMs;
+    const ago = lastRun ? Math.round((now - lastRun) / 60000) : null;
+
+    if (errors > 0) {
+      erroring.push({ name: job.name, errors, lastStatus, ago, agentId: job.agentId });
+    } else if (!enabled) {
+      disabled.push({ name: job.name, agentId: job.agentId });
+    } else {
+      healthy.push({ name: job.name, lastStatus, ago, agentId: job.agentId });
+    }
+  }
+
+  const lines = [];
+
+  if (erroring.length > 0) {
+    lines.push(`\u{1F534} **Jobs with errors (${erroring.length})**`);
+    for (const j of erroring.sort((a, b) => b.errors - a.errors)) {
+      const agoStr = j.ago !== null ? `${j.ago}m ago` : "never";
+      lines.push(`  \u{1F6A8} **${j.name}** — ${j.errors} consecutive errors (last: ${j.lastStatus}, ${agoStr})`);
+    }
+    lines.push("");
+  }
+
+  if (disabled.length > 0) {
+    lines.push(`\u{26AA} **Disabled jobs (${disabled.length})**`);
+    for (const j of disabled.slice(0, 10)) {
+      lines.push(`  \u2022 ${j.name} (${j.agentId})`);
+    }
+    if (disabled.length > 10) {
+      lines.push(`  _...and ${disabled.length - 10} more_`);
+    }
+    lines.push("");
+  }
+
+  const healthyCount = healthy.length;
+  const totalJobs = jobs.length;
+
+  if (erroring.length === 0) {
+    lines.unshift(`\u{1F7E2} **All ${healthyCount} enabled cron jobs healthy**\n`);
+  } else {
+    lines.unshift(`\u{1F4CB} **Cron Health** — ${healthyCount}/${totalJobs} healthy\n`);
+  }
+
+  lines.push(`_Total: ${totalJobs} jobs (${healthyCount} healthy, ${erroring.length} erroring, ${disabled.length} disabled)_`);
+
+  await auditLog(ctx.userId, "cron", [], ctx.chatId, `${erroring.length}_errors`);
+  return ctx.reply(lines.join("\n"));
+}
+
 async function handleWatchdog(ctx) {
   const now = Date.now();
   const pid = watchdogState.lastPid;
@@ -1674,6 +1747,9 @@ async function routeCommand(ctx, cmd, args) {
         break;
       case "rollback":
         await handleRollback(ctx, args);
+        break;
+      case "cron":
+        await handleCron(ctx);
         break;
       case "watchdog":
         await handleWatchdog(ctx);
