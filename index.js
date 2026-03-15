@@ -22,6 +22,9 @@
  *   !swap               — Show current Anthropic auth profile order
  *   !swap swap          — Flip primary/fallback Anthropic profile
  *   !swap <name>        — Set a specific profile as primary (watson, jeremy)
+ *   !remote             — Show remote-control session status + URL
+ *   !remote start       — Start Claude Code remote-control (accessible via claude.ai/code)
+ *   !remote stop        — Stop the remote-control session
  *   !keys status        — Show auth-profile health across all agents
  *   !backup             — Snapshot the current gateway config
  *   !rollback           — Restore last known good config + restart gateway
@@ -59,6 +62,8 @@ const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
 const { exec, execFile } = require("child_process");
+const { promisify } = require("util");
+const execPromise = promisify(exec);
 
 // ---------------------------------------------------------------------------
 // Config — all customizable via environment variables
@@ -270,6 +275,7 @@ const COOLDOWNS = {
   ki: 5000,
   gc: 5000,
   swap: 3000,
+  remote: 5000,
 };
 const lastCommandTime = new Map();
 
@@ -1427,6 +1433,95 @@ async function handleSwap(ctx, args) {
 }
 
 // ---------------------------------------------------------------------------
+// !remote — Start/stop/status Claude Code remote-control session
+// ---------------------------------------------------------------------------
+
+const REMOTE_TMUX_SESSION = "claude-remote";
+const REMOTE_CWD = path.join(os.homedir(), "projects");
+
+async function handleRemote(ctx, args) {
+  const sub = args[0]?.toLowerCase() || "status";
+
+  if (sub === "start") {
+    // Check if already running
+    try {
+      const { stdout } = await execPromise(`tmux has-session -t ${REMOTE_TMUX_SESSION} 2>&1 && echo RUNNING || echo STOPPED`);
+      if (stdout.trim() === "RUNNING") {
+        // Grab the URL from the tmux pane
+        const { stdout: paneOut } = await execPromise(`tmux capture-pane -t ${REMOTE_TMUX_SESSION} -p 2>/dev/null | grep -o 'https://claude.ai/code[^ ]*' | tail -1`);
+        const url = paneOut.trim();
+        return ctx.reply(
+          url
+            ? `\u{1F7E2} Remote session already running.\n\n**Connect:** ${url}`
+            : `\u{1F7E2} Remote session already running (URL not yet available — check back in a moment).`
+        );
+      }
+    } catch {}
+
+    // Start new tmux session with remote-control
+    const name = args.slice(1).join(" ") || "Watson Mac Mini";
+    try {
+      await execPromise(
+        `tmux new-session -d -s ${REMOTE_TMUX_SESSION} -c "${REMOTE_CWD}" ` +
+        `"${path.join(os.homedir(), ".local/bin/claude")} remote-control --name \\"${name}\\" --permission-mode acceptEdits 2>&1"`
+      );
+
+      // Wait a moment for the URL to appear
+      await new Promise((r) => setTimeout(r, 4000));
+
+      const { stdout: urlOut } = await execPromise(`tmux capture-pane -t ${REMOTE_TMUX_SESSION} -p 2>/dev/null | grep -o 'https://claude.ai/code[^ ]*' | tail -1`);
+      const url = urlOut.trim();
+
+      await auditLog(ctx.userId, "remote", ["start", name], ctx.chatId, "started");
+      return ctx.reply(
+        [
+          `\u{1F4BB} **Remote Control started** — \`${name}\``,
+          "",
+          url ? `**Connect:** ${url}` : "_URL loading — run `!remote` in a moment to see it._",
+          "",
+          `_Working dir: \`${REMOTE_CWD}\` | Permission: acceptEdits_`,
+        ].join("\n")
+      );
+    } catch (err) {
+      return ctx.reply(`\u{274C} Failed to start remote: ${err.message}`);
+    }
+  }
+
+  if (sub === "stop") {
+    try {
+      await execPromise(`tmux kill-session -t ${REMOTE_TMUX_SESSION} 2>&1`);
+      await auditLog(ctx.userId, "remote", ["stop"], ctx.chatId, "stopped");
+      return ctx.reply("\u{1F534} Remote Control session stopped.");
+    } catch {
+      return ctx.reply("No remote session running.");
+    }
+  }
+
+  // Default: status
+  try {
+    const { stdout } = await execPromise(`tmux has-session -t ${REMOTE_TMUX_SESSION} 2>&1 && echo RUNNING || echo STOPPED`);
+    if (stdout.trim() !== "RUNNING") {
+      return ctx.reply(`\u{26AA} No remote session running. Use \`${ctx.prefix}remote start\` to start one.`);
+    }
+
+    const { stdout: urlOut } = await execPromise(`tmux capture-pane -t ${REMOTE_TMUX_SESSION} -p 2>/dev/null | grep -o 'https://claude.ai/code[^ ]*' | tail -1`);
+    const url = urlOut.trim();
+
+    return ctx.reply(
+      [
+        `\u{1F7E2} **Remote Control is running**`,
+        url ? `\n**Connect:** ${url}` : "",
+        `\n_tmux session: \`${REMOTE_TMUX_SESSION}\` | dir: \`${REMOTE_CWD}\`_`,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+  } catch {
+    return ctx.reply(`\u{26AA} No remote session running. Use \`${ctx.prefix}remote start\` to start one.`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // !help
 // ---------------------------------------------------------------------------
 
@@ -1478,6 +1573,11 @@ async function handleHelp(ctx) {
       `\`${p}swap swap\` \u2014 Flip primary/fallback Anthropic profile`,
       `\`${p}swap watson\` \u2014 Set watson as primary`,
       `\`${p}swap jeremy\` \u2014 Set jeremy as primary`,
+      "",
+      "**Remote Control**",
+      `\`${p}remote\` \u2014 Show remote-control session status`,
+      `\`${p}remote start [name]\` \u2014 Start a Claude Code remote session`,
+      `\`${p}remote stop\` \u2014 Stop the remote session`,
       "",
       "**Operations**",
       `\`${p}handoff [agent]\` \u2014 Write handoff \u2192 reset \u2192 breadcrumb (preserves context)`,
@@ -2737,6 +2837,9 @@ async function routeCommand(ctx, cmd, args) {
         break;
       case "swap":
         await handleSwap(ctx, args);
+        break;
+      case "remote":
+        await handleRemote(ctx, args);
         break;
       case "help":
         await handleHelp(ctx);
