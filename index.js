@@ -1436,8 +1436,8 @@ async function handleSwap(ctx, args) {
 // !remote — Start/stop/status Claude Code remote-control session
 // ---------------------------------------------------------------------------
 
-const REMOTE_TMUX_SESSION = "claude-remote";
-const REMOTE_CWD = path.join(os.homedir(), "projects");
+const REMOTE_TMUX_SESSION = "watson-cc";
+const REMOTE_CWD = os.homedir();
 
 async function handleRemote(ctx, args) {
   const sub = args[0]?.toLowerCase() || "status";
@@ -1479,7 +1479,7 @@ async function handleRemote(ctx, args) {
           "",
           url ? `**Connect:** ${url}` : "_URL loading — run `!remote` in a moment to see it._",
           "",
-          `_Working dir: \`${REMOTE_CWD}\` | Permission: acceptEdits_`,
+          `_tmux: \`${REMOTE_TMUX_SESSION}\` | Watson bridge: active | Permission: acceptEdits_`,
         ].join("\n")
       );
     } catch (err) {
