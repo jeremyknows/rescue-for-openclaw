@@ -22,9 +22,11 @@
  *   !swap               — Show current Anthropic auth profile order
  *   !swap swap          — Flip primary/fallback Anthropic profile
  *   !swap <name>        — Set a specific profile as primary (watson, jeremy)
- *   !remote             — Show remote-control session status + URL
- *   !remote start       — Start Claude Code remote-control (accessible via claude.ai/code)
- *   !remote stop        — Stop the remote-control session
+ *   !remote             — Show all remote-control sessions + connect URLs
+ *   !remote start       — Start main session (watson-cc, accessible via claude.ai/code)
+ *   !remote start <name> — Start named session (watson-cc-<name>)
+ *   !remote stop [name] — Stop a session (default: main)
+ *   !remote stop all    — Stop all remote sessions
  *   !keys status        — Show auth-profile health across all agents
  *   !backup             — Snapshot the current gateway config
  *   !rollback           — Restore last known good config + restart gateway
@@ -1433,53 +1435,79 @@ async function handleSwap(ctx, args) {
 }
 
 // ---------------------------------------------------------------------------
-// !remote — Start/stop/status Claude Code remote-control session
+// !remote — Start/stop/status Claude Code remote-control sessions
 // ---------------------------------------------------------------------------
 
-const REMOTE_TMUX_SESSION = "watson-cc";
+const REMOTE_TMUX_PREFIX = "watson-cc";
 const REMOTE_CWD = os.homedir();
+const CLAUDE_BIN = path.join(os.homedir(), ".local/bin/claude");
+
+function remoteSessionName(suffix) {
+  return suffix ? `${REMOTE_TMUX_PREFIX}-${suffix}` : REMOTE_TMUX_PREFIX;
+}
+
+async function getRemoteUrl(tmuxSession) {
+  try {
+    const { stdout } = await execPromise(
+      `tmux capture-pane -t ${tmuxSession} -p 2>/dev/null | grep -o 'https://claude.ai/code[^ ]*' | tail -1`
+    );
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function listRemoteSessions() {
+  try {
+    const { stdout } = await execPromise(`tmux list-sessions -F '#{session_name}' 2>/dev/null`);
+    return stdout
+      .trim()
+      .split("\n")
+      .filter((s) => s === REMOTE_TMUX_PREFIX || s.startsWith(`${REMOTE_TMUX_PREFIX}-`));
+  } catch {
+    return [];
+  }
+}
 
 async function handleRemote(ctx, args) {
   const sub = args[0]?.toLowerCase() || "status";
 
   if (sub === "start") {
+    const suffix = args[1]?.toLowerCase().replace(/[^a-z0-9-]/g, "") || "";
+    const tmuxSession = remoteSessionName(suffix);
+    const displayName = suffix || "main";
+
     // Check if already running
     try {
-      const { stdout } = await execPromise(`tmux has-session -t ${REMOTE_TMUX_SESSION} 2>&1 && echo RUNNING || echo STOPPED`);
+      const { stdout } = await execPromise(`tmux has-session -t ${tmuxSession} 2>&1 && echo RUNNING || echo STOPPED`);
       if (stdout.trim() === "RUNNING") {
-        // Grab the URL from the tmux pane
-        const { stdout: paneOut } = await execPromise(`tmux capture-pane -t ${REMOTE_TMUX_SESSION} -p 2>/dev/null | grep -o 'https://claude.ai/code[^ ]*' | tail -1`);
-        const url = paneOut.trim();
+        const url = await getRemoteUrl(tmuxSession);
         return ctx.reply(
           url
-            ? `\u{1F7E2} Remote session already running.\n\n**Connect:** ${url}`
-            : `\u{1F7E2} Remote session already running (URL not yet available — check back in a moment).`
+            ? `\u{1F7E2} **${displayName}** already running.\n**Connect:** ${url}`
+            : `\u{1F7E2} **${displayName}** already running (URL loading — try \`${ctx.prefix}remote\` in a moment).`
         );
       }
     } catch {}
 
-    // Start new tmux session with remote-control
-    const name = args.slice(1).join(" ") || "Watson Mac Mini";
+    const remoteName = suffix ? `Watson CC — ${suffix}` : "Watson Mac Mini";
     try {
       await execPromise(
-        `tmux new-session -d -s ${REMOTE_TMUX_SESSION} -c "${REMOTE_CWD}" ` +
-        `"${path.join(os.homedir(), ".local/bin/claude")} remote-control --name \\"${name}\\" --permission-mode acceptEdits 2>&1"`
+        `tmux new-session -d -s ${tmuxSession} -c "${REMOTE_CWD}" ` +
+        `"${CLAUDE_BIN} remote-control --name \\"${remoteName}\\" --permission-mode acceptEdits 2>&1"`
       );
 
-      // Wait a moment for the URL to appear
       await new Promise((r) => setTimeout(r, 4000));
+      const url = await getRemoteUrl(tmuxSession);
 
-      const { stdout: urlOut } = await execPromise(`tmux capture-pane -t ${REMOTE_TMUX_SESSION} -p 2>/dev/null | grep -o 'https://claude.ai/code[^ ]*' | tail -1`);
-      const url = urlOut.trim();
-
-      await auditLog(ctx.userId, "remote", ["start", name], ctx.chatId, "started");
+      await auditLog(ctx.userId, "remote", ["start", displayName], ctx.chatId, "started");
       return ctx.reply(
         [
-          `\u{1F4BB} **Remote Control started** — \`${name}\``,
+          `\u{1F4BB} **Remote started** — \`${displayName}\``,
           "",
-          url ? `**Connect:** ${url}` : "_URL loading — run `!remote` in a moment to see it._",
+          url ? `**Connect:** ${url}` : "_URL loading — run `!remote` in a moment._",
           "",
-          `_tmux: \`${REMOTE_TMUX_SESSION}\` | Watson bridge: active | Permission: acceptEdits_`,
+          `_tmux: \`${tmuxSession}\` | Watson bridge: \`cc-tmux-send.sh${suffix ? ` -s ${suffix}` : ""}\`_`,
         ].join("\n")
       );
     } catch (err) {
@@ -1488,37 +1516,46 @@ async function handleRemote(ctx, args) {
   }
 
   if (sub === "stop") {
+    const suffix = args[1]?.toLowerCase().replace(/[^a-z0-9-]/g, "") || "";
+
+    if (suffix === "all") {
+      const sessions = await listRemoteSessions();
+      if (sessions.length === 0) return ctx.reply("No remote sessions running.");
+      for (const s of sessions) {
+        try { await execPromise(`tmux kill-session -t ${s} 2>&1`); } catch {}
+      }
+      await auditLog(ctx.userId, "remote", ["stop", "all"], ctx.chatId, `stopped_${sessions.length}`);
+      return ctx.reply(`\u{1F534} Stopped ${sessions.length} remote session${sessions.length !== 1 ? "s" : ""}.`);
+    }
+
+    const tmuxSession = remoteSessionName(suffix);
     try {
-      await execPromise(`tmux kill-session -t ${REMOTE_TMUX_SESSION} 2>&1`);
-      await auditLog(ctx.userId, "remote", ["stop"], ctx.chatId, "stopped");
-      return ctx.reply("\u{1F534} Remote Control session stopped.");
+      await execPromise(`tmux kill-session -t ${tmuxSession} 2>&1`);
+      await auditLog(ctx.userId, "remote", ["stop", suffix || "main"], ctx.chatId, "stopped");
+      return ctx.reply(`\u{1F534} Stopped remote session \`${suffix || "main"}\`.`);
     } catch {
-      return ctx.reply("No remote session running.");
+      return ctx.reply(`No remote session \`${suffix || "main"}\` running.`);
     }
   }
 
-  // Default: status
-  try {
-    const { stdout } = await execPromise(`tmux has-session -t ${REMOTE_TMUX_SESSION} 2>&1 && echo RUNNING || echo STOPPED`);
-    if (stdout.trim() !== "RUNNING") {
-      return ctx.reply(`\u{26AA} No remote session running. Use \`${ctx.prefix}remote start\` to start one.`);
-    }
-
-    const { stdout: urlOut } = await execPromise(`tmux capture-pane -t ${REMOTE_TMUX_SESSION} -p 2>/dev/null | grep -o 'https://claude.ai/code[^ ]*' | tail -1`);
-    const url = urlOut.trim();
-
+  // Default: status — show all running sessions
+  const sessions = await listRemoteSessions();
+  if (sessions.length === 0) {
     return ctx.reply(
-      [
-        `\u{1F7E2} **Remote Control is running**`,
-        url ? `\n**Connect:** ${url}` : "",
-        `\n_tmux session: \`${REMOTE_TMUX_SESSION}\` | dir: \`${REMOTE_CWD}\`_`,
-      ]
-        .filter(Boolean)
-        .join("\n")
+      `\u{26AA} No remote sessions running.\n\`${ctx.prefix}remote start\` — start main session\n\`${ctx.prefix}remote start build\` — start a named session`
     );
-  } catch {
-    return ctx.reply(`\u{26AA} No remote session running. Use \`${ctx.prefix}remote start\` to start one.`);
   }
+
+  const lines = [`\u{1F4BB} **Remote Sessions** (${sessions.length})\n`];
+  for (const s of sessions) {
+    const suffix = s === REMOTE_TMUX_PREFIX ? "" : s.slice(REMOTE_TMUX_PREFIX.length + 1);
+    const label = suffix || "main";
+    const url = await getRemoteUrl(s);
+    lines.push(`\u{1F7E2} **${label}** — ${url ? url : "_no URL yet_"}`);
+    lines.push(`  _tmux: \`${s}\` | bridge: \`cc-tmux-send.sh${suffix ? ` -s ${suffix}` : ""}\`_`);
+  }
+
+  return ctx.reply(lines.join("\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,9 +1612,11 @@ async function handleHelp(ctx) {
       `\`${p}swap jeremy\` \u2014 Set jeremy as primary`,
       "",
       "**Remote Control**",
-      `\`${p}remote\` \u2014 Show remote-control session status`,
-      `\`${p}remote start [name]\` \u2014 Start a Claude Code remote session`,
-      `\`${p}remote stop\` \u2014 Stop the remote session`,
+      `\`${p}remote\` \u2014 Show all remote sessions + URLs`,
+      `\`${p}remote start\` \u2014 Start main session (watson-cc)`,
+      `\`${p}remote start build\` \u2014 Start named session (watson-cc-build)`,
+      `\`${p}remote stop [name]\` \u2014 Stop a session (default: main)`,
+      `\`${p}remote stop all\` \u2014 Stop all remote sessions`,
       "",
       "**Operations**",
       `\`${p}handoff [agent]\` \u2014 Write handoff \u2192 reset \u2192 breadcrumb (preserves context)`,
