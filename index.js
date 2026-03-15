@@ -25,6 +25,11 @@
  *   !rollback list      — Show recent config backups
  *   !cron               — Show cron job health and errors
  *   !watchdog           — Show gateway health and restart history
+ *   !handoff [agent]    — Write handoff → reset → breadcrumb (preserves context)
+ *   !mc [start|stop|status] — Manage Mission Control dashboard
+ *   !ki [start|stop|status] — Manage Knowledge Intake server (localhost:7420)
+ *   !gc                 — Session GC status (RSS, prune stats, archive stats)
+ *   !gc run             — Trigger manual garbage collection now
  *   !help               — Display command help
  *
  * Environment (at least one platform required):
@@ -106,6 +111,21 @@ const watchdogState = {
   lastAlertTime: 0,
   lastCheckTime: 0,
   status: "starting",
+};
+
+// Session GC (garbage collector)
+const GC_INTERVAL = 30 * 60 * 1000; // 30 minutes
+const GC_CRON_RUN_MAX_AGE_MS = 6 * 3600 * 1000; // 6h for ephemeral :run: sessions
+const GC_ORPHAN_MIN_AGE_S = 3600; // 1h before archiving orphans
+const GC_GATEWAY_RSS_RESTART_MB = 2500; // restart gateway if RSS exceeds this
+const GC_STATUS_FILE = "/tmp/openclaw-ops-status.json";
+const CRON_JOBS_PATH = path.join(OPENCLAW_DIR, "cron", "jobs.json");
+const gcState = {
+  lastRun: 0,
+  lastResult: null,
+  totalPruned: 0,
+  totalArchived: 0,
+  gatewayRestarts: 0,
 };
 
 // Require at least one platform
@@ -241,6 +261,10 @@ const COOLDOWNS = {
   rollback: 10000,
   watchdog: 2000,
   cron: 3000,
+  handoff: 30000,
+  mc: 5000,
+  ki: 5000,
+  gc: 5000,
 };
 const lastCommandTime = new Map();
 
@@ -271,6 +295,25 @@ async function auditLog(userId, command, args, channelId, result) {
     await fsp.appendFile(AUDIT_LOG, JSON.stringify(entry) + "\n");
   } catch (err) {
     console.error("[rescue] Failed to write audit log:", err.message);
+  }
+}
+
+/** Send an alert to configured ops channels (Discord + Telegram). */
+async function sendOpsAlert(text) {
+  if (OPS_CHANNEL_ID && discordClient) {
+    try {
+      const channel = await discordClient.channels.fetch(OPS_CHANNEL_ID);
+      if (channel?.isTextBased()) await channel.send(text);
+    } catch (err) {
+      console.error("[rescue] Ops alert (Discord) failed:", err.message);
+    }
+  }
+  if (OPS_TELEGRAM_CHAT && telegramBot) {
+    try {
+      await telegramBot.api.sendMessage(OPS_TELEGRAM_CHAT, text);
+    } catch (err) {
+      console.error("[rescue] Ops alert (Telegram) failed:", err.message);
+    }
   }
 }
 
@@ -1346,6 +1389,15 @@ async function handleHelp(ctx) {
       `\`${p}rollback list\` \u2014 Show available config backups`,
       `\`${p}cron\` \u2014 Show cron job health and errors`,
       `\`${p}watchdog\` \u2014 Show gateway health and restart history`,
+      "",
+      "**Operations**",
+      `\`${p}handoff [agent]\` \u2014 Write handoff \u2192 reset \u2192 breadcrumb (preserves context)`,
+      `\`${p}handoff --dry-run\` \u2014 Show what would happen without executing`,
+      `\`${p}mc [start|stop|status]\` \u2014 Manage Mission Control dashboard`,
+      `\`${p}ki [start|stop|status]\` \u2014 Manage Knowledge Intake server (localhost:7420)`,
+      `\`${p}gc\` \u2014 Session GC status (RSS, pruned, archived)`,
+      `\`${p}gc run\` \u2014 Trigger manual garbage collection`,
+      "",
       `\`${p}help\` \u2014 This message`,
       aliasLine,
     ]
@@ -1710,6 +1762,821 @@ async function handleWatchdog(ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// !handoff — context-preserving reset (write handoff → reset → breadcrumb)
+// ---------------------------------------------------------------------------
+
+const HANDOFF_MEMORY_DIR = path.join(
+  AGENTS_DIR,
+  "main",
+  "workspace",
+  "memory"
+);
+
+async function handleHandoff(ctx, args) {
+  const dryRun = args.includes("--dry-run");
+  const agentArg = args.find((a) => !a.startsWith("--"));
+
+  // Resolve agent — default to this channel's agent
+  let agentId;
+  if (agentArg) {
+    agentId = await resolveAgentId(agentArg);
+    if (!agentId) {
+      const list = await formatAgentList();
+      return ctx.reply(`Agent \`${agentArg}\` not found. Available: ${list}`);
+    }
+  } else {
+    const session = await findSessionByChat(ctx.chatId, ctx.platform);
+    if (!session) {
+      return ctx.reply(
+        `No agent session in this channel. Specify one: \`${ctx.prefix}handoff <agent>\``
+      );
+    }
+    agentId = session.agentId;
+  }
+
+  // Find the session
+  const session = await findSessionByChat(ctx.chatId, ctx.platform);
+  if (!session || session.agentId !== agentId) {
+    const sessions = await findSessionsByAgent(agentId);
+    if (sessions.length === 0) {
+      return ctx.reply(
+        `No sessions found for **${agentDisplayName(agentId)}**.`
+      );
+    }
+  }
+
+  const usage = session ? getUsageInfo(session.entry) : null;
+  const now = new Date();
+  const timestamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 16);
+  const handoffFile = path.join(
+    AGENTS_DIR,
+    agentId,
+    "workspace",
+    "memory",
+    `${timestamp}-context-handoff.md`
+  );
+
+  if (dryRun) {
+    const lines = [
+      `\u{1F50D} **Handoff dry-run for ${agentDisplayName(agentId)}**`,
+      "",
+      `**Session:** ${usage ? `${usage.pct}% context used` : "no session in this channel"}`,
+      `**Handoff file:** \`${path.basename(handoffFile)}\``,
+      "",
+      "**Would do:**",
+      "1. Ask agent to write context handoff to memory",
+      "2. Reset the session",
+      "3. Leave breadcrumb in new session",
+      "",
+      `_Run \`${ctx.prefix}handoff${agentArg ? " " + agentArg : ""}\` to execute._`,
+    ];
+    await auditLog(ctx.userId, "handoff", ["--dry-run", agentId], ctx.chatId, "dry_run");
+    return ctx.reply(lines.join("\n"));
+  }
+
+  await ctx.reply(
+    `\u{1F4DD} Starting handoff for **${agentDisplayName(agentId)}**...`
+  );
+
+  // Step 1: Write a handoff prompt to the agent's session via the gateway
+  // We send a message to the agent asking it to write its handoff
+  const handoffPrompt =
+    `URGENT: Your session is about to be reset. ` +
+    `Write a concise context handoff to ${handoffFile} covering: ` +
+    `what you were working on, current state, and what the next session needs to know. ` +
+    `Keep it under 500 words. Write the file NOW.`;
+
+  // Send the handoff prompt through the gateway API
+  try {
+    await new Promise((resolve, reject) => {
+      const payload = JSON.stringify({
+        agentId,
+        message: handoffPrompt,
+      });
+      const req = require("http").request(
+        {
+          hostname: "127.0.0.1",
+          port: 18789,
+          path: "/api/message",
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload),
+          },
+          timeout: 30000,
+        },
+        (res) => {
+          let body = "";
+          res.on("data", (chunk) => (body += chunk));
+          res.on("end", () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve(body);
+            } else {
+              reject(new Error(`Gateway responded ${res.statusCode}: ${body.slice(0, 200)}`));
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      req.on("timeout", () => {
+        req.destroy();
+        reject(new Error("Gateway request timed out (30s)"));
+      });
+      req.write(payload);
+      req.end();
+    });
+
+    await ctx.send("\u2705 Handoff message sent to agent. Waiting for response...");
+
+    // Give agent time to write the handoff file
+    await new Promise((r) => setTimeout(r, 15000));
+
+    // Check if the handoff file was written
+    let handoffWritten = false;
+    try {
+      await fsp.access(handoffFile);
+      handoffWritten = true;
+    } catch {
+      // Check for any recent handoff file (agent may have used a slightly different name)
+      try {
+        const memDir = path.join(AGENTS_DIR, agentId, "workspace", "memory");
+        const files = await fsp.readdir(memDir);
+        const recent = files
+          .filter((f) => f.includes("handoff") && f.endsWith(".md"))
+          .sort()
+          .reverse();
+        if (recent.length > 0) {
+          const stat = await fsp.stat(path.join(memDir, recent[0]));
+          if (Date.now() - stat.mtimeMs < 60000) {
+            handoffWritten = true;
+          }
+        }
+      } catch {
+        // No memory dir
+      }
+    }
+
+    if (handoffWritten) {
+      await ctx.send("\u{1F4BE} Handoff file written.");
+    } else {
+      await ctx.send(
+        "\u{26A0}\uFE0F No handoff file detected (agent may not have written one). Continuing with reset..."
+      );
+    }
+  } catch (err) {
+    await ctx.send(
+      `\u{26A0}\uFE0F Could not reach gateway for handoff prompt: ${err.message}\nContinuing with reset anyway...`
+    );
+  }
+
+  // Step 2: Reset the session
+  if (session) {
+    await resetSession(session);
+    await ctx.send(
+      `\u{1F504} Session reset (was at ${usage ? usage.pct + "%" : "unknown"} context).`
+    );
+  }
+
+  // Step 3: Leave a breadcrumb — write a note so the next session picks up the handoff
+  const breadcrumbFile = path.join(
+    AGENTS_DIR,
+    agentId,
+    "workspace",
+    "memory",
+    "HANDOFF_BREADCRUMB.md"
+  );
+  try {
+    const breadcrumb =
+      `# Session Handoff — ${now.toISOString()}\n\n` +
+      `A handoff was performed. Check the latest handoff file in this directory:\n` +
+      `\`ls -t *handoff*.md | head -1\`\n\n` +
+      `Previous session was at ${usage ? usage.pct + "%" : "unknown"} context.\n` +
+      `Triggered by: rescue-bot !handoff command\n`;
+    await fsp.mkdir(path.dirname(breadcrumbFile), { recursive: true });
+    await fsp.writeFile(breadcrumbFile, breadcrumb);
+  } catch (err) {
+    console.error("[rescue] Failed to write breadcrumb:", err.message);
+  }
+
+  await auditLog(
+    ctx.userId,
+    "handoff",
+    [agentId],
+    ctx.chatId,
+    `reset_${usage ? usage.pct + "pct" : "unknown"}`
+  );
+
+  return ctx.send(
+    `\u{2705} **Handoff complete for ${agentDisplayName(agentId)}.**\n` +
+      `Context has been preserved. The next message will start a fresh session with breadcrumb.`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// !mc — Manage Mission Control dashboard
+// ---------------------------------------------------------------------------
+
+const MC_DIR = path.join(os.homedir(), "jeremy-hq");
+const MC_PLIST = path.join(
+  os.homedir(),
+  "Library",
+  "LaunchAgents",
+  "com.openclaw.mission-control-restart.plist"
+);
+const MC_PORT = 3000;
+
+function mcGetPid() {
+  return new Promise((resolve) => {
+    exec(
+      `lsof -ti :${MC_PORT} 2>/dev/null | head -1`,
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const pid = parseInt(stdout.trim(), 10);
+        resolve(isNaN(pid) ? null : pid);
+      }
+    );
+  });
+}
+
+async function handleMc(ctx, args) {
+  const sub = (args[0] || "status").toLowerCase();
+
+  if (sub === "start") {
+    const existing = await mcGetPid();
+    if (existing) {
+      return ctx.reply(
+        `Mission Control is already running (PID ${existing}). http://127.0.0.1:${MC_PORT}/`
+      );
+    }
+
+    await ctx.reply("\u{1F680} Starting Mission Control...");
+
+    exec(
+      `cd ${MC_DIR} && npm run dev > /dev/null 2>&1 &`,
+      { timeout: 10000, cwd: MC_DIR },
+      () => {}
+    );
+
+    // Wait a few seconds for the server to start
+    await new Promise((r) => setTimeout(r, 5000));
+
+    const pid = await mcGetPid();
+    if (pid) {
+      await auditLog(ctx.userId, "mc", ["start"], ctx.chatId, `started_pid_${pid}`);
+      return ctx.send(
+        `\u{2705} Mission Control started (PID ${pid}). http://127.0.0.1:${MC_PORT}/`
+      );
+    } else {
+      await auditLog(ctx.userId, "mc", ["start"], ctx.chatId, "start_failed");
+      return ctx.send(
+        "\u{274C} Mission Control may not have started. Check logs at `~/.openclaw/logs/mc-restart.log`."
+      );
+    }
+  }
+
+  if (sub === "stop") {
+    const pid = await mcGetPid();
+    if (!pid) {
+      return ctx.reply("Mission Control is not running.");
+    }
+
+    await new Promise((resolve) => {
+      exec(
+        `kill ${pid} 2>/dev/null; pkill -f "next-server" 2>/dev/null; pkill -f "next dev" 2>/dev/null`,
+        { timeout: 5000 },
+        () => resolve()
+      );
+    });
+
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const check = await mcGetPid();
+    if (check) {
+      await auditLog(ctx.userId, "mc", ["stop"], ctx.chatId, "stop_failed");
+      return ctx.reply(`\u{26A0}\uFE0F Process still running (PID ${check}). May need \`kill -9 ${check}\`.`);
+    }
+
+    await auditLog(ctx.userId, "mc", ["stop"], ctx.chatId, "stopped");
+    return ctx.reply("\u{2705} Mission Control stopped.");
+  }
+
+  if (sub === "status") {
+    const pid = await mcGetPid();
+    const lines = [
+      `\u{1F4CA} **Mission Control**`,
+      "",
+      `**Status:** ${pid ? `\u{1F7E2} Running (PID ${pid})` : "\u{1F534} Stopped"}`,
+      `**URL:** http://127.0.0.1:${MC_PORT}/`,
+      `**Directory:** \`${MC_DIR}\``,
+    ];
+
+    await auditLog(ctx.userId, "mc", ["status"], ctx.chatId, pid ? `running_${pid}` : "stopped");
+    return ctx.reply(lines.join("\n"));
+  }
+
+  return ctx.reply(
+    `Usage: \`${ctx.prefix}mc [start|stop|status]\``
+  );
+}
+
+// ---------------------------------------------------------------------------
+// !ki — Manage Knowledge Intake server
+// ---------------------------------------------------------------------------
+
+const KI_PORT = 7420;
+const KI_PLIST = path.join(
+  os.homedir(),
+  "Library",
+  "LaunchAgents",
+  "ai.watson.knowledge-intake-poll.plist"
+);
+
+function kiGetPid() {
+  return new Promise((resolve) => {
+    exec(
+      `lsof -ti :${KI_PORT} 2>/dev/null | head -1`,
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const pid = parseInt(stdout.trim(), 10);
+        resolve(isNaN(pid) ? null : pid);
+      }
+    );
+  });
+}
+
+function kiLaunchdLoaded() {
+  return new Promise((resolve) => {
+    exec(
+      `launchctl list ai.watson.knowledge-intake-poll 2>/dev/null`,
+      { timeout: 5000 },
+      (err, stdout) => {
+        resolve(!err && stdout.includes("ai.watson.knowledge-intake-poll"));
+      }
+    );
+  });
+}
+
+async function handleKi(ctx, args) {
+  const sub = (args[0] || "status").toLowerCase();
+  const uid = process.getuid ? process.getuid() : 501;
+
+  if (sub === "start") {
+    const loaded = await kiLaunchdLoaded();
+    if (loaded) {
+      const pid = await kiGetPid();
+      if (pid) {
+        return ctx.reply(
+          `Knowledge Intake is already running (PID ${pid}). http://localhost:${KI_PORT}/`
+        );
+      }
+    }
+
+    await ctx.reply("\u{1F680} Starting Knowledge Intake...");
+
+    await new Promise((resolve) => {
+      exec(
+        `launchctl bootstrap gui/${uid} ${KI_PLIST} 2>/dev/null; launchctl kickstart gui/${uid}/ai.watson.knowledge-intake-poll 2>/dev/null`,
+        { timeout: 10000 },
+        () => resolve()
+      );
+    });
+
+    await new Promise((r) => setTimeout(r, 3000));
+
+    const pid = await kiGetPid();
+    const loaded2 = await kiLaunchdLoaded();
+
+    if (pid) {
+      await auditLog(ctx.userId, "ki", ["start"], ctx.chatId, `started_pid_${pid}`);
+      return ctx.send(
+        `\u{2705} Knowledge Intake started (PID ${pid}). http://localhost:${KI_PORT}/`
+      );
+    } else if (loaded2) {
+      await auditLog(ctx.userId, "ki", ["start"], ctx.chatId, "loaded_no_pid");
+      return ctx.send(
+        `\u{2705} Knowledge Intake launchd job loaded (polling service, may not have a persistent listener on :${KI_PORT}).`
+      );
+    } else {
+      await auditLog(ctx.userId, "ki", ["start"], ctx.chatId, "start_failed");
+      return ctx.send(
+        `\u{274C} Could not start Knowledge Intake. Check plist at \`${KI_PLIST}\`.`
+      );
+    }
+  }
+
+  if (sub === "stop") {
+    const loaded = await kiLaunchdLoaded();
+    const pid = await kiGetPid();
+
+    if (!loaded && !pid) {
+      return ctx.reply("Knowledge Intake is not running.");
+    }
+
+    await new Promise((resolve) => {
+      exec(
+        `launchctl bootout gui/${uid}/ai.watson.knowledge-intake-poll 2>/dev/null`,
+        { timeout: 10000 },
+        () => resolve()
+      );
+    });
+
+    if (pid) {
+      await new Promise((resolve) => {
+        exec(`kill ${pid} 2>/dev/null`, { timeout: 5000 }, () => resolve());
+      });
+    }
+
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const check = await kiGetPid();
+    if (check) {
+      await auditLog(ctx.userId, "ki", ["stop"], ctx.chatId, "stop_failed");
+      return ctx.reply(`\u{26A0}\uFE0F Process still running (PID ${check}). May need manual kill.`);
+    }
+
+    await auditLog(ctx.userId, "ki", ["stop"], ctx.chatId, "stopped");
+    return ctx.reply("\u{2705} Knowledge Intake stopped.");
+  }
+
+  if (sub === "status") {
+    const pid = await kiGetPid();
+    const loaded = await kiLaunchdLoaded();
+
+    const lines = [
+      `\u{1F4CA} **Knowledge Intake**`,
+      "",
+      `**Status:** ${pid ? `\u{1F7E2} Running (PID ${pid})` : loaded ? "\u{1F7E1} Loaded (no listener)" : "\u{1F534} Stopped"}`,
+      `**URL:** http://localhost:${KI_PORT}/`,
+      `**Launchd:** ${loaded ? "loaded" : "not loaded"}`,
+      `**Plist:** \`${KI_PLIST}\``,
+    ];
+
+    await auditLog(ctx.userId, "ki", ["status"], ctx.chatId, pid ? `running_${pid}` : loaded ? "loaded" : "stopped");
+    return ctx.reply(lines.join("\n"));
+  }
+
+  return ctx.reply(
+    `Usage: \`${ctx.prefix}ki [start|stop|status]\``
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Session GC — automated garbage collection for sessions + gateway memory
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the RSS (resident set size) of the gateway process in MB.
+ * Returns null if gateway is not running.
+ */
+function getGatewayRssMb() {
+  return new Promise((resolve) => {
+    exec(
+      `ps -p $(pgrep -f openclaw-gateway | head -1) -o rss= 2>/dev/null`,
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const kb = parseInt(stdout.trim(), 10);
+        resolve(isNaN(kb) ? null : Math.round(kb / 1024));
+      }
+    );
+  });
+}
+
+/**
+ * Get the set of active cron job IDs from the gateway's jobs.json.
+ */
+async function getActiveCronIds() {
+  try {
+    const raw = await fsp.readFile(CRON_JOBS_PATH, "utf-8");
+    const data = JSON.parse(raw);
+    const jobs = data.jobs || [];
+    return new Set(jobs.filter((j) => j.enabled !== false).map((j) => j.id));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Run session garbage collection for one agent.
+ * Returns { prunedEntries, archivedFiles }.
+ */
+async function gcAgent(agentId, activeCronIds) {
+  const sessionsDir = path.join(AGENTS_DIR, agentId, "sessions");
+  const sessionsFile = path.join(sessionsDir, "sessions.json");
+  let prunedEntries = 0;
+  let archivedFiles = 0;
+
+  // --- Phase 1: Prune sessions.json entries ---
+  let data;
+  try {
+    const raw = await fsp.readFile(sessionsFile, "utf-8");
+    data = JSON.parse(raw);
+    if (typeof data !== "object" || Array.isArray(data)) return { prunedEntries: 0, archivedFiles: 0 };
+  } catch {
+    return { prunedEntries: 0, archivedFiles: 0 };
+  }
+
+  const now = Date.now();
+  const cleaned = {};
+  const keptSessionIds = new Set();
+
+  for (const [key, entry] of Object.entries(data)) {
+    let keep = true;
+
+    if (key.includes(":cron:") && key.includes(":run:")) {
+      // Ephemeral cron run — remove if older than threshold
+      const updated = entry.updatedAt || entry.createdAt || 0;
+      if (now - updated > GC_CRON_RUN_MAX_AGE_MS) keep = false;
+    } else if (key.includes(":cron:") && !key.includes(":run:")) {
+      // Cron base session — remove if cron job no longer exists
+      const cronIdMatch = key.match(/:cron:([a-f0-9-]+)/);
+      if (cronIdMatch && !activeCronIds.has(cronIdMatch[1])) keep = false;
+    } else if (key.includes(":subagent:")) {
+      // Subagent sessions — remove if older than 24h
+      const updated = entry.updatedAt || entry.createdAt || 0;
+      if (now - updated > 24 * 3600 * 1000) keep = false;
+    }
+
+    // Also prune entries whose transcript file is missing
+    if (keep && entry.sessionId) {
+      const jsonlPath = path.join(sessionsDir, `${entry.sessionId}.jsonl`);
+      try {
+        await fsp.access(jsonlPath);
+      } catch {
+        // Transcript gone — prune the entry unless it's a Discord/Telegram session
+        // (those auto-recreate and the missing file is normal after reset)
+        if (!key.includes("discord:") && !key.includes("telegram:")) {
+          keep = false;
+        }
+      }
+    }
+
+    if (keep) {
+      cleaned[key] = entry;
+      if (entry.sessionId) keptSessionIds.add(entry.sessionId);
+      // Also track sessionFile basenames
+      if (entry.sessionFile) keptSessionIds.add(path.basename(entry.sessionFile, ".jsonl"));
+    } else {
+      prunedEntries++;
+    }
+  }
+
+  // Write cleaned sessions.json if anything changed
+  if (prunedEntries > 0) {
+    const lockDir = await acquireLock(sessionsFile).catch(() => null);
+    if (lockDir) {
+      try {
+        const tmpFile = sessionsFile + ".tmp";
+        await fsp.writeFile(tmpFile, JSON.stringify(cleaned, null, 2));
+        await fsp.rename(tmpFile, sessionsFile);
+      } finally {
+        await releaseLock(lockDir);
+      }
+    }
+  }
+
+  // --- Phase 2: Archive orphaned .jsonl files ---
+  const archiveDir = path.join(sessionsDir, `_gc-${new Date().toISOString().slice(0, 10)}`);
+  let entries;
+  try {
+    entries = await fsp.readdir(sessionsDir);
+  } catch {
+    return { prunedEntries, archivedFiles: 0 };
+  }
+
+  for (const fname of entries) {
+    if (!fname.endsWith(".jsonl")) continue;
+    const sessionId = fname.replace(".jsonl", "");
+    if (keptSessionIds.has(sessionId)) continue;
+    if (keptSessionIds.has(fname)) continue;
+
+    // Check file age — don't archive recent files
+    const filePath = path.join(sessionsDir, fname);
+    try {
+      const stat = await fsp.stat(filePath);
+      const ageS = (Date.now() - stat.mtimeMs) / 1000;
+      if (ageS < GC_ORPHAN_MIN_AGE_S) continue;
+
+      await fsp.mkdir(archiveDir, { recursive: true });
+      await fsp.rename(filePath, path.join(archiveDir, fname));
+      archivedFiles++;
+    } catch {
+      // Skip files we can't stat/move
+    }
+  }
+
+  // --- Phase 3: Clean up old .deleted.* files (>7 days) ---
+  for (const fname of entries) {
+    if (!fname.includes(".deleted.")) continue;
+    const filePath = path.join(sessionsDir, fname);
+    try {
+      const stat = await fsp.stat(filePath);
+      if (Date.now() - stat.mtimeMs > 7 * 24 * 3600 * 1000) {
+        await fsp.unlink(filePath);
+      }
+    } catch {
+      // Skip
+    }
+  }
+
+  return { prunedEntries, archivedFiles };
+}
+
+/**
+ * Write a machine-readable status file for dashboards.
+ */
+async function writeStatusFile(result) {
+  const status = {
+    timestamp: new Date().toISOString(),
+    gateway: {
+      pid: watchdogState.lastPid,
+      status: watchdogState.status,
+      rssMb: result.rssMb,
+    },
+    gc: {
+      lastRun: new Date(gcState.lastRun).toISOString(),
+      prunedEntries: result.totalPruned,
+      archivedFiles: result.totalArchived,
+      lifetimePruned: gcState.totalPruned,
+      lifetimeArchived: gcState.totalArchived,
+      lifetimeGatewayRestarts: gcState.gatewayRestarts,
+    },
+    agents: result.agentSummaries,
+  };
+  try {
+    await fsp.writeFile(GC_STATUS_FILE, JSON.stringify(status, null, 2));
+  } catch (err) {
+    console.error("[rescue] Failed to write status file:", err.message);
+  }
+}
+
+/**
+ * Main GC loop — runs every GC_INTERVAL.
+ */
+async function runSessionGC() {
+  const startTime = Date.now();
+  const agents = await listAgentIds();
+  const activeCronIds = await getActiveCronIds();
+  let totalPruned = 0;
+  let totalArchived = 0;
+  const agentSummaries = {};
+
+  for (const agentId of agents) {
+    try {
+      const { prunedEntries, archivedFiles } = await gcAgent(agentId, activeCronIds);
+      totalPruned += prunedEntries;
+      totalArchived += archivedFiles;
+
+      // Count remaining sessions for status
+      const sessionsFile = path.join(AGENTS_DIR, agentId, "sessions", "sessions.json");
+      try {
+        const raw = await fsp.readFile(sessionsFile, "utf-8");
+        const data = JSON.parse(raw);
+        agentSummaries[agentId] = Object.keys(data).length;
+      } catch {
+        agentSummaries[agentId] = 0;
+      }
+    } catch (err) {
+      console.error(`[rescue] GC error for ${agentId}:`, err.message);
+    }
+  }
+
+  gcState.totalPruned += totalPruned;
+  gcState.totalArchived += totalArchived;
+
+  // Check gateway RSS and restart if bloated
+  const rssMb = await getGatewayRssMb();
+  let gatewayRestarted = false;
+
+  if (rssMb !== null && rssMb > GC_GATEWAY_RSS_RESTART_MB) {
+    // Check for in-flight work before restarting
+    let inFlightCount = 0;
+    let inFlightNames = [];
+    try {
+      const cronData = JSON.parse(require("fs").readFileSync(
+        require("path").join(require("os").homedir(), ".openclaw/cron/jobs.json"), "utf8"
+      ));
+      const runningJobs = (cronData.jobs || []).filter(j => j.state && j.state.runningAtMs);
+      inFlightCount += runningJobs.length;
+      inFlightNames.push(...runningJobs.map(j => j.name));
+    } catch (_) {}
+
+    if (inFlightCount > 0) {
+      const names = inFlightNames.join(", ");
+      console.log(`[rescue] GC: RSS ${rssMb}MB exceeds threshold but ${inFlightCount} job(s) in flight (${names}) — deferring restart`);
+      await sendOpsAlert(
+        `⚠️ **Session GC: Restart deferred**\n` +
+        `RSS ${rssMb}MB exceeds ${GC_GATEWAY_RSS_RESTART_MB}MB threshold, but ${inFlightCount} cron job(s) are running:\n` +
+        `\`${names}\`\n` +
+        `_Will restart on next GC cycle if RSS still high and jobs complete._`
+      );
+    } else {
+      console.log(`[rescue] GC: Gateway RSS ${rssMb}MB exceeds ${GC_GATEWAY_RSS_RESTART_MB}MB — restarting`);
+      gcState.gatewayRestarts++;
+      gatewayRestarted = true;
+
+      await new Promise((resolve) => exec("pkill -f openclaw-gateway", () => resolve()));
+
+      const alertMsg =
+        `\u267B\uFE0F **Session GC: Gateway auto-restarted**\n` +
+        `RSS was ${rssMb}MB (threshold: ${GC_GATEWAY_RSS_RESTART_MB}MB)\n` +
+        `Pruned ${totalPruned} sessions, archived ${totalArchived} files\n` +
+        `_Launchd will auto-restart the gateway._`;
+      await sendOpsAlert(alertMsg);
+    } // end else (no in-flight jobs)
+  }
+
+  const result = {
+    totalPruned,
+    totalArchived,
+    rssMb,
+    gatewayRestarted,
+    durationMs: Date.now() - startTime,
+    agentSummaries,
+  };
+
+  gcState.lastRun = Date.now();
+  gcState.lastResult = result;
+
+  await writeStatusFile(result);
+
+  if (totalPruned > 0 || totalArchived > 0 || gatewayRestarted) {
+    console.log(
+      `[rescue] GC: pruned=${totalPruned} archived=${totalArchived} rss=${rssMb || "?"}MB restarted=${gatewayRestarted} (${result.durationMs}ms)`
+    );
+  }
+
+  return result;
+}
+
+async function handleGc(ctx, args) {
+  const sub = args[0]?.toLowerCase();
+
+  if (sub === "run") {
+    await ctx.reply("\u267B\uFE0F Running session GC...");
+    try {
+      const result = await runSessionGC();
+      const lines = [
+        `\u2705 **Session GC complete** (${result.durationMs}ms)`,
+        "",
+        `**Pruned:** ${result.totalPruned} session entries`,
+        `**Archived:** ${result.totalArchived} orphaned files`,
+        `**Gateway RSS:** ${result.rssMb || "unknown"}MB${result.gatewayRestarted ? " \u2192 **restarted**" : ""}`,
+      ];
+
+      if (Object.keys(result.agentSummaries).length > 0) {
+        lines.push("", "**Remaining sessions per agent:**");
+        for (const [agent, count] of Object.entries(result.agentSummaries)) {
+          if (count > 0) lines.push(`  ${agent}: ${count}`);
+        }
+      }
+
+      await auditLog(ctx.userId, "gc", ["run"], ctx.chatId, `pruned=${result.totalPruned} archived=${result.totalArchived}`);
+      return ctx.reply(lines.join("\n"));
+    } catch (err) {
+      await auditLog(ctx.userId, "gc", ["run"], ctx.chatId, `error: ${err.message}`);
+      return ctx.reply(`\u274C GC failed: ${err.message}`);
+    }
+  }
+
+  // Default: show GC status
+  const rssMb = await getGatewayRssMb();
+  const lines = [
+    `\u267B\uFE0F **Session GC Status**`,
+    "",
+    `**Gateway RSS:** ${rssMb || "unknown"}MB ${rssMb && rssMb > GC_GATEWAY_RSS_RESTART_MB ? "\u26A0\uFE0F above threshold" : rssMb ? "\u2705" : ""}`,
+    `**Auto-restart threshold:** ${GC_GATEWAY_RSS_RESTART_MB}MB`,
+    `**GC interval:** every ${GC_INTERVAL / 60000} min`,
+    `**Last GC:** ${gcState.lastRun ? `${Math.round((Date.now() - gcState.lastRun) / 60000)} min ago` : "never"}`,
+  ];
+
+  if (gcState.lastResult) {
+    const r = gcState.lastResult;
+    lines.push(
+      "",
+      "**Last run:**",
+      `  Pruned: ${r.totalPruned} entries, Archived: ${r.totalArchived} files`,
+      `  Duration: ${r.durationMs}ms${r.gatewayRestarted ? ", gateway restarted" : ""}`
+    );
+  }
+
+  lines.push(
+    "",
+    "**Lifetime:**",
+    `  Pruned: ${gcState.totalPruned} entries`,
+    `  Archived: ${gcState.totalArchived} files`,
+    `  Gateway restarts: ${gcState.gatewayRestarts}`,
+    "",
+    `_Use \`${ctx.prefix}gc run\` to trigger manually._`
+  );
+
+  await auditLog(ctx.userId, "gc", [], ctx.chatId, `rss=${rssMb}`);
+  return ctx.reply(lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
 // Command router — shared by both platforms
 // ---------------------------------------------------------------------------
 
@@ -1753,6 +2620,18 @@ async function routeCommand(ctx, cmd, args) {
         break;
       case "watchdog":
         await handleWatchdog(ctx);
+        break;
+      case "handoff":
+        await handleHandoff(ctx, args);
+        break;
+      case "mc":
+        await handleMc(ctx, args);
+        break;
+      case "ki":
+        await handleKi(ctx, args);
+        break;
+      case "gc":
+        await handleGc(ctx, args);
         break;
       case "help":
         await handleHelp(ctx);
@@ -1804,6 +2683,22 @@ function startMonitors() {
   checkGatewayHealth().catch(() => {});
   console.log(
     `[rescue] Watchdog active (${WATCHDOG_INTERVAL / 1000}s interval, alert on ${WATCHDOG_CRASH_THRESHOLD}+ restarts in ${WATCHDOG_CRASH_WINDOW / 60000}min)`
+  );
+
+  // Session GC — runs every 30min, prunes dead sessions, archives orphans, checks gateway RSS
+  setInterval(() => {
+    runSessionGC().catch((err) => {
+      console.error("[rescue] Session GC error:", err.message);
+    });
+  }, GC_INTERVAL);
+  // Run initial GC after 60s (let gateway stabilize first)
+  setTimeout(() => {
+    runSessionGC().catch((err) => {
+      console.error("[rescue] Initial GC error:", err.message);
+    });
+  }, 60 * 1000);
+  console.log(
+    `[rescue] Session GC active (${GC_INTERVAL / 60000}min interval, RSS restart at ${GC_GATEWAY_RSS_RESTART_MB}MB)`
   );
 }
 
