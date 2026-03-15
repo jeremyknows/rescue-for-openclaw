@@ -126,6 +126,7 @@ const gcState = {
   totalPruned: 0,
   totalArchived: 0,
   gatewayRestarts: 0,
+  consecutiveDeferrals: 0, // tracks how many GC cycles we've deferred restart due to in-flight jobs
 };
 
 // Require at least one platform
@@ -2463,16 +2464,29 @@ async function runSessionGC() {
       inFlightNames.push(...runningJobs.map(j => j.name));
     } catch (_) {}
 
-    if (inFlightCount > 0) {
+    if (inFlightCount > 0 && gcState.consecutiveDeferrals < 2) {
+      // Defer only up to 2 cycles — if RSS is still high after that,
+      // the in-flight job is likely the cause (runaway/stuck), so force restart.
+      gcState.consecutiveDeferrals = (gcState.consecutiveDeferrals || 0) + 1;
       const names = inFlightNames.join(", ");
-      console.log(`[rescue] GC: RSS ${rssMb}MB exceeds threshold but ${inFlightCount} job(s) in flight (${names}) — deferring restart`);
+      console.log(`[rescue] GC: RSS ${rssMb}MB exceeds threshold but ${inFlightCount} job(s) in flight (${names}) — deferring restart (deferral #${gcState.consecutiveDeferrals})`);
       await sendOpsAlert(
-        `⚠️ **Session GC: Restart deferred**\n` +
+        `⚠️ **Session GC: Restart deferred (${gcState.consecutiveDeferrals}/2)**\n` +
         `RSS ${rssMb}MB exceeds ${GC_GATEWAY_RSS_RESTART_MB}MB threshold, but ${inFlightCount} cron job(s) are running:\n` +
         `\`${names}\`\n` +
-        `_Will restart on next GC cycle if RSS still high and jobs complete._`
+        `_Will force-restart on next cycle if RSS is still high._`
       );
     } else {
+      if (gcState.consecutiveDeferrals >= 2 && inFlightCount > 0) {
+        const names = inFlightNames.join(", ");
+        console.log(`[rescue] GC: RSS ${rssMb}MB still high after ${gcState.consecutiveDeferrals} deferrals — forcing restart (in-flight: ${names})`);
+        await sendOpsAlert(
+          `🚨 **Session GC: Forced restart** (RSS still high after ${gcState.consecutiveDeferrals} deferrals)\n` +
+          `RSS ${rssMb}MB — in-flight jobs may be the cause:\n\`${names}\`\n` +
+          `_Restarting anyway. Check these jobs for runaway behavior._`
+        );
+      }
+      gcState.consecutiveDeferrals = 0;
       console.log(`[rescue] GC: Gateway RSS ${rssMb}MB exceeds ${GC_GATEWAY_RSS_RESTART_MB}MB — restarting`);
       gcState.gatewayRestarts++;
       gatewayRestarted = true;
