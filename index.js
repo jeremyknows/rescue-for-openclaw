@@ -19,6 +19,9 @@
  *   !model default      — Clear model override
  *   !mute [agent]       — Require @mention for agent (Discord only)
  *   !unmute [agent]     — Let agent respond to all messages (Discord only)
+ *   !swap               — Show current Anthropic auth profile order
+ *   !swap swap          — Flip primary/fallback Anthropic profile
+ *   !swap <name>        — Set a specific profile as primary (watson, jeremy)
  *   !keys status        — Show auth-profile health across all agents
  *   !backup             — Snapshot the current gateway config
  *   !rollback           — Restore last known good config + restart gateway
@@ -266,6 +269,7 @@ const COOLDOWNS = {
   mc: 5000,
   ki: 5000,
   gc: 5000,
+  swap: 3000,
 };
 const lastCommandTime = new Map();
 
@@ -1345,6 +1349,84 @@ async function handleRollback(ctx, args) {
 }
 
 // ---------------------------------------------------------------------------
+// !swap — Swap Anthropic auth profile order
+// ---------------------------------------------------------------------------
+
+async function handleSwap(ctx, args) {
+  const sub = args[0]?.toLowerCase();
+
+  try {
+    const raw = await fsp.readFile(CONFIG_PATH, "utf-8");
+    const cfg = JSON.parse(raw);
+    const order = cfg.auth?.order?.anthropic;
+
+    if (!order || !Array.isArray(order) || order.length < 2) {
+      return ctx.reply(
+        "\u274C No Anthropic auth order configured (need at least 2 profiles)."
+      );
+    }
+
+    const current = order[0];
+    const fallback = order[1];
+    const label = (id) => id.replace("anthropic:", "");
+
+    if (sub === "status" || !sub) {
+      return ctx.reply(
+        [
+          "\u{1F511} **Anthropic Auth Order**",
+          `Primary: **${label(current)}** | Fallback: **${label(fallback)}**`,
+        ].join("\n")
+      );
+    }
+
+    let newOrder;
+    if (sub === "swap" || sub === "flip") {
+      newOrder = [fallback, current];
+    } else {
+      // Try to match a profile name: !swap watson, !swap jeremy
+      const target = order.find(
+        (id) => label(id).toLowerCase() === sub
+      );
+      if (!target) {
+        return ctx.reply(
+          `Unknown profile \`${sub}\`. Available: ${order.map((id) => `\`${label(id)}\``).join(", ")}`
+        );
+      }
+      if (target === current) {
+        return ctx.reply(
+          `\u{1F7E2} **${label(target)}** is already primary.`
+        );
+      }
+      newOrder = [target, ...order.filter((id) => id !== target)];
+    }
+
+    // Write updated config
+    cfg.auth.order.anthropic = newOrder;
+    const tmp = CONFIG_PATH + `.swap-${process.pid}.tmp`;
+    await fsp.writeFile(tmp, JSON.stringify(cfg, null, 2), "utf-8");
+    await fsp.rename(tmp, CONFIG_PATH);
+
+    await auditLog(
+      ctx.userId,
+      "swap",
+      args,
+      ctx.chatId,
+      `${label(newOrder[0])}_primary`
+    );
+
+    return ctx.reply(
+      [
+        `\u{1F504} **Swapped** — Primary: **${label(newOrder[0])}** | Fallback: **${label(newOrder[1])}**`,
+        "_Config hot-reloads \u2014 no gateway restart needed._",
+      ].join("\n")
+    );
+  } catch (err) {
+    console.error("[rescue] !swap error:", err.message);
+    return ctx.reply(`\u274C Swap failed: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // !help
 // ---------------------------------------------------------------------------
 
@@ -1390,6 +1472,12 @@ async function handleHelp(ctx) {
       `\`${p}rollback list\` \u2014 Show available config backups`,
       `\`${p}cron\` \u2014 Show cron job health and errors`,
       `\`${p}watchdog\` \u2014 Show gateway health and restart history`,
+      "",
+      "**Auth & Models**",
+      `\`${p}swap\` \u2014 Show current Anthropic auth order`,
+      `\`${p}swap swap\` \u2014 Flip primary/fallback Anthropic profile`,
+      `\`${p}swap watson\` \u2014 Set watson as primary`,
+      `\`${p}swap jeremy\` \u2014 Set jeremy as primary`,
       "",
       "**Operations**",
       `\`${p}handoff [agent]\` \u2014 Write handoff \u2192 reset \u2192 breadcrumb (preserves context)`,
@@ -2646,6 +2734,9 @@ async function routeCommand(ctx, cmd, args) {
         break;
       case "gc":
         await handleGc(ctx, args);
+        break;
+      case "swap":
+        await handleSwap(ctx, args);
         break;
       case "help":
         await handleHelp(ctx);
