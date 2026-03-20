@@ -22,10 +22,16 @@
  *   !swap               — Show current Anthropic auth profile order
  *   !swap swap          — Flip primary/fallback Anthropic profile
  *   !swap <name>        — Set a specific profile as primary (watson, jeremy)
+ *   !wcc                — Show all wcc sessions (uptime, status)
+ *   !wcc start          — Start Terminal (Claude Code + Discord channels)
+ *   !wcc start <name>   — Start plain session (watson-cc-<name>)
+ *   !wcc stop [name]    — Stop a session (default: terminal)
+ *   !wcc stop all       — Stop all wcc sessions
+ *   !wcc restart        — Restart Terminal with fresh context
  *   !remote             — Show all remote-control sessions + connect URLs
- *   !remote start       — Start main session (watson-cc, accessible via claude.ai/code)
- *   !remote start <name> — Start named session (watson-cc-<name>)
- *   !remote stop [name] — Stop a session (default: main)
+ *   !remote start       — Start remote session (watson-remote, accessible via claude.ai/code)
+ *   !remote start <name> — Start named remote session (watson-remote-<name>)
+ *   !remote stop [name] — Stop a remote session (default: main)
  *   !remote stop all    — Stop all remote sessions
  *   !keys status        — Show auth-profile health across all agents
  *   !backup             — Snapshot the current gateway config
@@ -127,7 +133,11 @@ const watchdogState = {
 const GC_INTERVAL = 30 * 60 * 1000; // 30 minutes
 const GC_CRON_RUN_MAX_AGE_MS = 6 * 3600 * 1000; // 6h for ephemeral :run: sessions
 const GC_ORPHAN_MIN_AGE_S = 3600; // 1h before archiving orphans
-const GC_GATEWAY_RSS_RESTART_MB = 2500; // restart gateway if RSS exceeds this
+const GC_GATEWAY_RSS_RESTART_MB = 5000; // restart gateway if RSS exceeds this (raised from 2500 — was causing restarts every 30min on 24GB M4)
+const GC_CONTEXT_ALERT_PCT = 85; // alert when session context usage >= this %
+const GC_SESSION_COUNT_ALERT = 100; // alert when main agent has more sessions than this
+const GC_ALERT_COOLDOWN_MS = 4 * 3600 * 1000; // 4h cooldown per session/count alert
+const GC_HEALTH_DRY_RUN = false; // set true to log-only (no Discord alerts) for first 2 weeks
 const GC_STATUS_FILE = "/tmp/openclaw-ops-status.json";
 const CRON_JOBS_PATH = path.join(OPENCLAW_DIR, "cron", "jobs.json");
 const gcState = {
@@ -137,6 +147,8 @@ const gcState = {
   totalArchived: 0,
   gatewayRestarts: 0,
   consecutiveDeferrals: 0, // tracks how many GC cycles we've deferred restart due to in-flight jobs
+  contextAlertTimes: {}, // sessionId → last alert timestamp (cooldown tracking)
+  lastCountAlert: 0, // last session-count alert timestamp
 };
 
 // Require at least one platform
@@ -1438,7 +1450,7 @@ async function handleSwap(ctx, args) {
 // !remote — Start/stop/status Claude Code remote-control sessions
 // ---------------------------------------------------------------------------
 
-const REMOTE_TMUX_PREFIX = "watson-cc";
+const REMOTE_TMUX_PREFIX = "watson-remote";
 const REMOTE_CWD = os.homedir();
 const CLAUDE_BIN = path.join(os.homedir(), ".local/bin/claude");
 
@@ -1559,6 +1571,133 @@ async function handleRemote(ctx, args) {
 }
 
 // ---------------------------------------------------------------------------
+// !wcc — Manage Terminal (Claude Code + Discord channels) tmux sessions
+// ---------------------------------------------------------------------------
+
+const WCC_TMUX_PREFIX = "watson-cc";
+const WCC_START_SCRIPT = path.join(os.homedir(), ".openclaw/scripts/start-terminal.sh");
+
+async function listWccSessions() {
+  try {
+    const { stdout } = await execPromise(`tmux list-sessions -F '#{session_name}:#{session_created}:#{session_attached}' 2>/dev/null`);
+    return stdout
+      .trim()
+      .split("\n")
+      .filter((s) => s.startsWith(WCC_TMUX_PREFIX))
+      .map((line) => {
+        const [name, created, attached] = line.split(":");
+        const suffix = name === WCC_TMUX_PREFIX ? "" : name.slice(WCC_TMUX_PREFIX.length + 1);
+        const uptime = created ? Math.floor((Date.now() / 1000 - parseInt(created)) / 60) : 0;
+        return { name, suffix, uptime, attached: attached === "1" };
+      });
+  } catch {
+    return [];
+  }
+}
+
+async function handleWcc(ctx, args) {
+  const sub = args[0]?.toLowerCase() || "status";
+
+  if (sub === "start") {
+    const rawSuffix = args[1] || "";
+    const suffix = rawSuffix.toLowerCase().replace(/[^a-z0-9-]/g, "");
+
+    // Reject empty-after-sanitization input
+    if (rawSuffix && !suffix) {
+      return ctx.reply(`\u{274C} Invalid session name: \`${rawSuffix}\``);
+    }
+
+    const tmuxSession = suffix ? `${WCC_TMUX_PREFIX}-${suffix}` : WCC_TMUX_PREFIX;
+    const displayName = suffix || "terminal";
+
+    // Check if already running
+    try {
+      const { stdout } = await execPromise(`tmux has-session -t ${tmuxSession} 2>&1 && echo RUNNING || echo STOPPED`);
+      if (stdout.trim() === "RUNNING") {
+        return ctx.reply(`\u{1F7E2} **${displayName}** already running.`);
+      }
+    } catch {}
+
+    try {
+      const startArgs = suffix ? `--detached ${suffix}` : "--detached";
+      await execPromise(`"${WCC_START_SCRIPT}" ${startArgs}`);
+
+      await auditLog(ctx.userId, "wcc", ["start", displayName], ctx.chatId, "started");
+      const isDefault = !suffix;
+      return ctx.reply(
+        [
+          `\u{1F4BB} **WCC started** \u2014 \`${displayName}\``,
+          isDefault ? "\u{1F4E1} Discord channels active" : "",
+          "",
+          `_tmux: \`${tmuxSession}\` | bridge: \`cc-tmux-send.sh${suffix ? ` -s ${suffix}` : ""}\`_`,
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+    } catch (err) {
+      return ctx.reply(`\u{274C} Failed to start wcc: ${err.message}`);
+    }
+  }
+
+  if (sub === "stop") {
+    const target = args[1]?.toLowerCase().replace(/[^a-z0-9-]/g, "") || "";
+
+    if (target === "all") {
+      const sessions = await listWccSessions();
+      if (sessions.length === 0) return ctx.reply("No wcc sessions running.");
+      for (const s of sessions) {
+        try { await execPromise(`tmux kill-session -t ${s.name} 2>&1`); } catch {}
+      }
+      await auditLog(ctx.userId, "wcc", ["stop", "all"], ctx.chatId, `stopped_${sessions.length}`);
+      return ctx.reply(`\u{1F534} Stopped ${sessions.length} wcc session${sessions.length !== 1 ? "s" : ""}.`);
+    }
+
+    const tmuxSession = target ? `${WCC_TMUX_PREFIX}-${target}` : WCC_TMUX_PREFIX;
+    try {
+      await execPromise(`tmux kill-session -t ${tmuxSession} 2>&1`);
+      await auditLog(ctx.userId, "wcc", ["stop", target || "terminal"], ctx.chatId, "stopped");
+      return ctx.reply(`\u{1F534} Stopped wcc session \`${target || "terminal"}\`.`);
+    } catch {
+      return ctx.reply(`No wcc session \`${target || "terminal"}\` running.`);
+    }
+  }
+
+  if (sub === "restart") {
+    const tmuxSession = WCC_TMUX_PREFIX;
+    try { await execPromise(`tmux kill-session -t ${tmuxSession} 2>&1`); } catch {}
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      await execPromise(`"${WCC_START_SCRIPT}" --detached`);
+      await auditLog(ctx.userId, "wcc", ["restart"], ctx.chatId, "restarted");
+      return ctx.reply("\u{1F504} Terminal restarted with Discord channels.");
+    } catch (err) {
+      return ctx.reply(`\u{274C} Failed to restart: ${err.message}`);
+    }
+  }
+
+  // Default: status — list all wcc sessions
+  const sessions = await listWccSessions();
+  if (sessions.length === 0) {
+    return ctx.reply(
+      `\u{26AA} No wcc sessions running.\n\`${ctx.prefix}wcc start\` \u2014 start Terminal (Discord channels)\n\`${ctx.prefix}wcc start research\` \u2014 start a plain session`
+    );
+  }
+
+  const lines = [`\u{1F4BB} **WCC Sessions** (${sessions.length})\n`];
+  for (const s of sessions) {
+    const label = s.suffix || "terminal";
+    const hours = Math.floor(s.uptime / 60);
+    const mins = s.uptime % 60;
+    const uptimeStr = hours > 0 ? `${hours}h${mins}m` : `${mins}m`;
+    const status = s.attached ? "attached" : "detached";
+    const channels = !s.suffix ? " \u{1F4E1}" : "";
+    lines.push(`\u{1F7E2} **${label}**${channels} \u2014 ${uptimeStr}, ${status}`);
+  }
+
+  return ctx.reply(lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
 // !help
 // ---------------------------------------------------------------------------
 
@@ -1611,11 +1750,19 @@ async function handleHelp(ctx) {
       `\`${p}swap watson\` \u2014 Set watson as primary`,
       `\`${p}swap jeremy\` \u2014 Set jeremy as primary`,
       "",
+      "**Terminal (Claude Code + Discord)**",
+      `\`${p}wcc\` \u2014 Show all wcc sessions (uptime, status)`,
+      `\`${p}wcc start\` \u2014 Start Terminal (Discord channels active)`,
+      `\`${p}wcc start <name>\` \u2014 Start plain session (watson-cc-<name>)`,
+      `\`${p}wcc stop [name]\` \u2014 Stop a session (default: terminal)`,
+      `\`${p}wcc stop all\` \u2014 Stop all wcc sessions`,
+      `\`${p}wcc restart\` \u2014 Restart Terminal with fresh context`,
+      "",
       "**Remote Control**",
       `\`${p}remote\` \u2014 Show all remote sessions + URLs`,
-      `\`${p}remote start\` \u2014 Start main session (watson-cc)`,
-      `\`${p}remote start build\` \u2014 Start named session (watson-cc-build)`,
-      `\`${p}remote stop [name]\` \u2014 Stop a session (default: main)`,
+      `\`${p}remote start\` \u2014 Start remote session (watson-remote)`,
+      `\`${p}remote start build\` \u2014 Start named remote (watson-remote-build)`,
+      `\`${p}remote stop [name]\` \u2014 Stop a remote session`,
       `\`${p}remote stop all\` \u2014 Stop all remote sessions`,
       "",
       "**Operations**",
@@ -2313,7 +2460,13 @@ async function handleMc(ctx, args) {
 // ---------------------------------------------------------------------------
 
 const KI_PORT = 7420;
-const KI_PLIST = path.join(
+const KI_SERVER_PLIST = path.join(
+  os.homedir(),
+  "Library",
+  "LaunchAgents",
+  "ai.watson.knowledge-intake-server.plist"
+);
+const KI_POLL_PLIST = path.join(
   os.homedir(),
   "Library",
   "LaunchAgents",
@@ -2337,10 +2490,10 @@ function kiGetPid() {
 function kiLaunchdLoaded() {
   return new Promise((resolve) => {
     exec(
-      `launchctl list ai.watson.knowledge-intake-poll 2>/dev/null`,
+      `launchctl list ai.watson.knowledge-intake-server 2>/dev/null`,
       { timeout: 5000 },
       (err, stdout) => {
-        resolve(!err && stdout.includes("ai.watson.knowledge-intake-poll"));
+        resolve(!err && stdout.includes("ai.watson.knowledge-intake-server"));
       }
     );
   });
@@ -2365,7 +2518,7 @@ async function handleKi(ctx, args) {
 
     await new Promise((resolve) => {
       exec(
-        `launchctl bootstrap gui/${uid} ${KI_PLIST} 2>/dev/null; launchctl kickstart gui/${uid}/ai.watson.knowledge-intake-poll 2>/dev/null`,
+        `launchctl bootstrap gui/${uid} ${KI_SERVER_PLIST} 2>/dev/null; launchctl kickstart gui/${uid}/ai.watson.knowledge-intake-server 2>/dev/null; launchctl bootstrap gui/${uid} ${KI_POLL_PLIST} 2>/dev/null; launchctl kickstart gui/${uid}/ai.watson.knowledge-intake-poll 2>/dev/null`,
         { timeout: 10000 },
         () => resolve()
       );
@@ -2389,7 +2542,7 @@ async function handleKi(ctx, args) {
     } else {
       await auditLog(ctx.userId, "ki", ["start"], ctx.chatId, "start_failed");
       return ctx.send(
-        `\u{274C} Could not start Knowledge Intake. Check plist at \`${KI_PLIST}\`.`
+        `\u{274C} Could not start Knowledge Intake. Check plist at \`${KI_SERVER_PLIST}\`.`
       );
     }
   }
@@ -2404,7 +2557,7 @@ async function handleKi(ctx, args) {
 
     await new Promise((resolve) => {
       exec(
-        `launchctl bootout gui/${uid}/ai.watson.knowledge-intake-poll 2>/dev/null`,
+        `launchctl bootout gui/${uid}/ai.watson.knowledge-intake-server 2>/dev/null; launchctl bootout gui/${uid}/ai.watson.knowledge-intake-poll 2>/dev/null`,
         { timeout: 10000 },
         () => resolve()
       );
@@ -2437,8 +2590,8 @@ async function handleKi(ctx, args) {
       "",
       `**Status:** ${pid ? `\u{1F7E2} Running (PID ${pid})` : loaded ? "\u{1F7E1} Loaded (no listener)" : "\u{1F534} Stopped"}`,
       `**URL:** http://localhost:${KI_PORT}/`,
-      `**Launchd:** ${loaded ? "loaded" : "not loaded"}`,
-      `**Plist:** \`${KI_PLIST}\``,
+      `**Server:** ${loaded ? "loaded" : "not loaded"}`,
+      `**Plist:** \`${KI_SERVER_PLIST}\``,
     ];
 
     await auditLog(ctx.userId, "ki", ["status"], ctx.chatId, pid ? `running_${pid}` : loaded ? "loaded" : "stopped");
@@ -2553,7 +2706,10 @@ async function gcAgent(agentId, activeCronIds) {
 
   // Write cleaned sessions.json if anything changed
   if (prunedEntries > 0) {
-    const lockDir = await acquireLock(sessionsFile).catch(() => null);
+    const lockDir = await acquireLock(sessionsFile).catch((err) => {
+      console.warn(`[rescue] GC: Lock acquisition failed for ${path.basename(path.dirname(sessionsFile))}, skipping prune: ${err.message || err}`);
+      return null;
+    });
     if (lockDir) {
       try {
         const tmpFile = sessionsFile + ".tmp";
@@ -2674,6 +2830,68 @@ async function runSessionGC() {
   gcState.totalPruned += totalPruned;
   gcState.totalArchived += totalArchived;
 
+  // --- Session health monitoring (main agent only) ---
+  try {
+    const mainSessionsFile = path.join(AGENTS_DIR, "main", "sessions", "sessions.json");
+    const mainRaw = await fsp.readFile(mainSessionsFile, "utf-8");
+    const mainData = JSON.parse(mainRaw);
+    const mainEntries = Object.entries(mainData);
+    const now = Date.now();
+    const hotSessions = [];
+
+    for (const [key, entry] of mainEntries) {
+      const usage = getUsageInfo(entry);
+      if (usage.pct >= GC_CONTEXT_ALERT_PCT) {
+        const lastAlert = gcState.contextAlertTimes[entry.sessionId] || 0;
+        if (now - lastAlert > GC_ALERT_COOLDOWN_MS) {
+          const label = entry.displayName || entry.origin?.label || key.split(":").slice(-1)[0];
+          hotSessions.push({ key, sessionId: entry.sessionId, label, pct: usage.pct, status: usage.status, emoji: usage.emoji, total: usage.total });
+          gcState.contextAlertTimes[entry.sessionId] = now;
+        }
+      }
+    }
+
+    // Session count alert
+    const mainCount = mainEntries.length;
+    let countAlert = false;
+    if (mainCount > GC_SESSION_COUNT_ALERT && now - gcState.lastCountAlert > GC_ALERT_COOLDOWN_MS) {
+      countAlert = true;
+      gcState.lastCountAlert = now;
+    }
+
+    // Emit alerts
+    if (hotSessions.length > 0 || countAlert) {
+      const lines = [];
+      if (hotSessions.length > 0) {
+        lines.push(`\u{1F6A8} **Session Health Alert** (Watson/main)`);
+        for (const s of hotSessions) {
+          lines.push(`${s.emoji} **${s.label}** — ${s.pct}% context (${Math.round(s.total / 1000)}K tokens)`);
+          console.log(`[rescue] Health: session ${s.sessionId} at ${s.pct}% — ${s.label}`);
+        }
+        lines.push(`_Run \`!handoff watson\` then \`!reset watson\` for bloated sessions._`);
+      }
+      if (countAlert) {
+        lines.push(`\u{26A0}\u{FE0F} **Session count: ${mainCount}** (threshold: ${GC_SESSION_COUNT_ALERT})`);
+        console.log(`[rescue] Health: main agent has ${mainCount} sessions (threshold: ${GC_SESSION_COUNT_ALERT})`);
+      }
+
+      if (GC_HEALTH_DRY_RUN) {
+        console.log(`[rescue] Health (DRY RUN — would alert): ${lines.join(" | ")}`);
+      } else {
+        await sendOpsAlert(lines.join("\n"));
+      }
+    }
+
+    // Prune stale cooldown entries (sessions that no longer exist)
+    for (const sid of Object.keys(gcState.contextAlertTimes)) {
+      if (!mainEntries.some(([, e]) => e.sessionId === sid)) {
+        delete gcState.contextAlertTimes[sid];
+      }
+    }
+  } catch (err) {
+    console.error("[rescue] Health check error:", err.message);
+  }
+
   // Check gateway RSS and restart if bloated
   const rssMb = await getGatewayRssMb();
   let gatewayRestarted = false;
@@ -2750,6 +2968,102 @@ async function runSessionGC() {
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// !flow — Decision queue management (resurface, list, unsnoze)
+// ---------------------------------------------------------------------------
+
+async function handleFlow(ctx, args) {
+  const sub = args[0]?.toLowerCase();
+  const DB_PATH = path.join(AGENTS_DIR, "main", "workspace", "data", "watsonflow.db");
+
+  let flowDb;
+  try {
+    flowDb = require("better-sqlite3")(DB_PATH, { readonly: false });
+  } catch (err) {
+    return ctx.reply(`\u274C Could not open watsonflow.db: ${err.message}`);
+  }
+
+  try {
+    if (sub === "resurface" || !sub) {
+      // Resurface the active waiting card in this channel (or #watson-main)
+      const channelId = args[1] || ctx.chatId;
+      const item = flowDb.prepare(
+        `SELECT * FROM pending_approvals WHERE status = 'waiting' AND COALESCE(channel_id, '1024127507055775808') = ? ORDER BY created_at ASC LIMIT 1`
+      ).get(channelId);
+
+      if (!item) {
+        return ctx.reply(`No waiting decision cards in this channel.\nUse \`!flow list\` to see all queued items.`);
+      }
+
+      // Clear message_id so daemon re-posts with proper card template on next poll (~30s)
+      flowDb.prepare(`UPDATE pending_approvals SET message_id = NULL WHERE id = ?`).run(item.id);
+
+      // Delete old message if it exists (best-effort)
+      if (item.message_id) {
+        const agentName = item.agent || 'watson';
+        let agentToken = process.env.DISCORD_BOT_TOKEN;
+        try {
+          const ocConfig = JSON.parse(require("fs").readFileSync(
+            path.join(require("os").homedir(), ".openclaw/openclaw.json"), "utf8"
+          ));
+          const t = ocConfig?.channels?.discord?.accounts?.[agentName]?.token;
+          if (t) agentToken = t;
+        } catch {}
+        try {
+          await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${item.message_id}`, {
+            method: "DELETE",
+            headers: { Authorization: `Bot ${agentToken}` },
+          });
+        } catch {}
+      }
+
+      await ctx.reply(`\u2705 Resurfacing: **${item.title}** — daemon will post the full card within 30s.`);
+
+    } else if (sub === "list") {
+      const items = flowDb.prepare(
+        `SELECT id, title, status, channel_id, agent, created_at FROM pending_approvals WHERE status IN ('waiting', 'snoozed') ORDER BY status, created_at`
+      ).all();
+
+      if (items.length === 0) {
+        return ctx.reply("Queue is empty — no waiting or snoozed items.");
+      }
+
+      const lines = items.map(i => {
+        const emoji = i.status === "waiting" ? "\u{1F7E2}" : "\u{1F7E1}";
+        const ch = i.channel_id ? `<#${i.channel_id}>` : "no channel";
+        return `${emoji} **${i.status}** | ${i.title.slice(0, 50)} | ${ch} | ${i.agent || "watson"}`;
+      });
+      await ctx.reply(`**Decision Queue** (${items.length} items)\n\n${lines.join("\n")}`);
+
+    } else if (sub === "unsnoze" || sub === "unsnooze" || sub === "wake") {
+      const target = args[1]; // optional: 'all' or approval ID
+      let updated;
+      if (target === "all") {
+        updated = flowDb.prepare(`UPDATE pending_approvals SET status = 'waiting', snooze_until = NULL WHERE status = 'snoozed'`).run().changes;
+      } else if (target) {
+        updated = flowDb.prepare(`UPDATE pending_approvals SET status = 'waiting', snooze_until = NULL WHERE id = ? AND status = 'snoozed'`).run(target).changes;
+      } else {
+        // Unsnoze items for this channel
+        const channelId = ctx.chatId;
+        updated = flowDb.prepare(`UPDATE pending_approvals SET status = 'waiting', snooze_until = NULL WHERE status = 'snoozed' AND channel_id = ?`).run(channelId).changes;
+      }
+      await ctx.reply(`\u2705 Unsnoozed ${updated} item(s). Daemon will surface them within 30s.`);
+
+    } else {
+      await ctx.reply(
+        `**!flow** — Decision queue commands\n\n` +
+        `\`!flow\` — Resurface the next waiting card in this channel\n` +
+        `\`!flow list\` — Show all waiting and snoozed items\n` +
+        `\`!flow unsnoze\` — Wake snoozed items in this channel\n` +
+        `\`!flow unsnoze all\` — Wake all snoozed items\n` +
+        `\`!flow resurface <channel_id>\` — Resurface card in a specific channel`
+      );
+    }
+  } finally {
+    flowDb.close();
+  }
 }
 
 async function handleGc(ctx, args) {
@@ -2874,11 +3188,17 @@ async function routeCommand(ctx, cmd, args) {
       case "gc":
         await handleGc(ctx, args);
         break;
+      case "flow":
+        await handleFlow(ctx, args);
+        break;
       case "swap":
         await handleSwap(ctx, args);
         break;
       case "remote":
         await handleRemote(ctx, args);
+        break;
+      case "wcc":
+        await handleWcc(ctx, args);
         break;
       case "help":
         await handleHelp(ctx);
