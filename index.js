@@ -1066,9 +1066,12 @@ async function handleReset(ctx, args) {
     `\u{1F504} **${name}**'s session in this channel has been reset (was at ${usage.pct}% context). Send a message to start fresh.`
   );
 }
-// Per-agent restart dispatch table — baked-in decision per phased plan T1.4.
-// terminal uses atlas.sh; bridges and CC daemons go through launchctl
-// kickstart -k. rescue is HARD-REJECTED (R3 §6 self-suicide block).
+// Per-agent restart dispatch table — unified model 2026-04-29:
+//   method: "atlas"     — CC tmux agents. Kill tmux + run start-X.sh
+//                         directly. Works regardless of plist load state.
+//   method: "launchctl" — pure launchd daemons (no tmux session). The
+//                         supervised process IS the program.
+// rescue is HARD-REJECTED (R3 §6 self-suicide block).
 const RESTART_DISPATCH = {
   terminal: {
     method: "atlas",
@@ -1076,48 +1079,52 @@ const RESTART_DISPATCH = {
       "/Users/watson/projects/system-pipes/scripts/atlas/start-terminal.sh",
     cmdArgs: ["--detached"],
     tmuxSession: "watson-cc",
-    label: "Terminal (atlas-managed CC tmux)",
+    label: "Terminal (CC tmux)",
   },
   dodo: {
-    method: "launchctl",
-    plist: "com.watson.dodo",
+    method: "atlas",
+    cmdPath: "/Users/watson/projects/system-pipes/scripts/atlas/start-dodo.sh",
+    cmdArgs: ["--detached"],
     tmuxSession: "watson-cc-dodo",
-    label: "Dodo (launchd-supervised CC)",
+    label: "Dodo (CC tmux)",
   },
   librarian: {
-    method: "launchctl",
-    plist: "com.watson.librarian",
+    method: "atlas",
+    cmdPath:
+      "/Users/watson/projects/system-pipes/scripts/atlas/start-librarian.sh",
+    cmdArgs: ["--detached"],
     tmuxSession: "watson-cc-librarian",
-    label: "Librarian (launchd-supervised CC)",
+    label: "Librarian (CC tmux)",
   },
   dispatch: {
-    method: "launchctl",
-    plist: "com.watson.dispatch",
+    method: "atlas",
+    cmdPath:
+      "/Users/watson/projects/system-pipes/scripts/atlas/start-dispatch.sh",
+    cmdArgs: ["--detached"],
     tmuxSession: "watson-cc-dispatch",
-    label: "Dispatch (launchd-supervised CC)",
+    label: "Dispatch (CC tmux)",
   },
   producer: {
-    method: "launchctl",
-    plist: "com.watson.producer",
+    method: "atlas",
+    cmdPath:
+      "/Users/watson/projects/system-pipes/scripts/atlas/start-producer.sh",
+    cmdArgs: ["--detached"],
     tmuxSession: "watson-cc-producer",
-    label: "Producer (launchd-supervised CC)",
+    label: "Producer (CC tmux)",
   },
   augur: {
-    // augur's launchd plist exists at ~/Library/LaunchAgents/com.watson.augur.plist
-    // but is not currently bootstrapped, so kickstart -k would fail.
-    // Use the same start-script the plist invokes — works regardless of load state.
     method: "atlas",
     cmdPath:
       "/Users/watson/projects/system-pipes/scripts/atlas/start-augur.sh",
     cmdArgs: ["--detached"],
     tmuxSession: "watson-cc-augur",
-    label: "Augur (start-script; plist not loaded)",
+    label: "Augur (CC tmux)",
   },
   "watson-bridge": {
     method: "launchctl",
     plist: "com.watson.watson-bridge",
     tmuxSession: null,
-    label: "Watson bridge daemon",
+    label: "Atlas bridge (Watson session router; legacy plist label)",
   },
   "builder-bridge": {
     method: "launchctl",
