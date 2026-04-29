@@ -1253,6 +1253,21 @@ async function handleRestart(ctx, args) {
           { timeout: 30_000 }
         );
       } else if (entry.method === "launchctl") {
+        // Same idempotency issue as the atlas method: launchd's tracked
+        // process is start-*.sh which exits 0 after spawning the tmux
+        // session. kickstart -k re-runs the script which sees the existing
+        // session and exits 0 — the actual Claude inside the tmux session
+        // is never killed. Kill the tmux first so the re-spawned script
+        // creates a fresh session. Bridges have tmuxSession: null and
+        // skip this — they're real launchd-supervised daemons.
+        // War story: 2026-04-29 !restart dodo silently no-op'd because
+        // this branch only ran kickstart -k.
+        if (entry.tmuxSession) {
+          await execPromise(
+            `tmux kill-session -t "${entry.tmuxSession}" 2>/dev/null || true`,
+            { timeout: 5_000 }
+          );
+        }
         const uid = process.getuid();
         await execPromise(
           `launchctl kickstart -k "gui/${uid}/${entry.plist}"`,
