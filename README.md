@@ -72,6 +72,18 @@ All commands work on both Discord and Telegram. Discord uses `!` prefix by defau
 | `!model show` | Show current model override |
 | `!model default` | Clear override, return to agent default |
 
+### Operations
+
+| Command | What it does |
+|---------|-------------|
+| `!handoff [agent]` | Context-preserving reset — writes handoff summary, resets session, leaves breadcrumb for the new session |
+| `!handoff --dry-run` | Preview what a handoff would do without executing |
+| `!mc [start\|stop\|status]` | Manage Mission Control dashboard (launchd) |
+| `!ki [start\|stop\|status]` | Manage Knowledge Intake server (localhost:7420) |
+| `!gc` | Show session GC status — gateway RSS, prune/archive stats |
+| `!gc run` | Trigger manual garbage collection |
+| `!cron` | Show cron job health and errors |
+
 ### System
 
 | Command | What it does |
@@ -88,11 +100,13 @@ All commands work on both Discord and Telegram. Discord uses `!` prefix by defau
 
 ## Background Monitors
 
-Rescue runs two background monitors automatically:
+Rescue runs three background monitors automatically:
 
 **Stall Detector** — Checks every 60 seconds for agents that received a message but haven't responded in 15+ minutes. Posts an alert in the channel where the agent is stuck.
 
-**Gateway Watchdog** — Polls the gateway process every 30 seconds. If it detects 3+ restarts within 5 minutes (crash-loop), it alerts your ops channel with recommended actions.
+**Gateway Watchdog** — Polls the gateway process every 30 seconds. If it detects 3+ restarts within 5 minutes (crash-loop), it auto-snapshots the config and alerts your ops channel with recommended actions.
+
+**Session GC** — Runs every 30 minutes. Prunes dead cron sessions (cron jobs that no longer exist), removes ephemeral run sessions older than 6 hours, archives orphaned transcript files, and monitors gateway RSS. If the gateway exceeds 2.5GB RSS (a symptom of session bloat), it automatically restarts it. Writes machine-readable status to `/tmp/openclaw-ops-status.json` for dashboards.
 
 ## Configuration
 
@@ -219,7 +233,7 @@ export RESCUE_AGENT_ALIASES='{"watson":"main","barker":"herald"}'
 
 ```
 rescue-for-openclaw/
-├── index.js        # The entire bot — single file, ~1800 lines
+├── index.js        # The entire bot — single file, ~2800 lines
 ├── package.json    # Two dependencies: discord.js + grammY
 ├── LICENSE         # MIT
 └── README.md
@@ -242,6 +256,9 @@ No build step. No config files. Clone, `npm install`, run.
 ## Roadmap
 
 - [x] **Telegram support** — same commands, works in Telegram groups alongside Discord
+- [x] **Session GC** — automatic garbage collection for dead cron sessions, orphaned files, and gateway memory bloat
+- [x] **Service management** — `!mc` and `!ki` for managing Mission Control and Knowledge Intake
+- [x] **Context-preserving resets** — `!handoff` writes a summary before resetting so the agent doesn't lose context
 - [ ] **Auto-rollback** (opt-in) — watchdog automatically restores last known good config on crash-loop
 - [ ] **Config diff** — `!diff` to show what changed between current config and last backup
 - [ ] **Health dashboard** — `!health` combining gateway status, session health, and API key state in one view
